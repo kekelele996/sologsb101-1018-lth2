@@ -146,15 +146,20 @@ export default function PolishBoard() {
     message.success(`已按 ${targets.length} 个道次生成目数序列（${GRIT_SEQUENCE.slice(0, targets.length).join(' / ')}）`);
   };
 
-  /** 打磨完成后把道次推进到已完成 */
+  /** 打磨完成后把道次推进到已完成；挂返工重确认账的道次须到工序台「返工重确认」 */
   const finishPolish = async (row: Polish): Promise<void> => {
     const coat = bodyCoats.find((item) => item.seq === row.seq);
     if (!coat) {
       message.warning('未找到对应道次');
       return;
     }
-    await updateCoat(coat.id, { state: 'done', needRecheck: false });
-    message.success(`第 ${row.seq} 道打磨完成，道次已置为已完成`);
+    if (coat.reconfirmBy.length > 0) {
+      message.warning('该道被质检返工定位打回，请在髹涂工序台用「返工重确认」按当前顺序销账');
+      return;
+    }
+    const notice = await updateCoat(coat.id, { state: 'done', needRecheck: false });
+    if (notice.ok) message.success(`第 ${row.seq} 道打磨完成，道次已置为已完成`);
+    else message.error(notice.message);
   };
 
   const columns: ColumnsType<Polish> = [

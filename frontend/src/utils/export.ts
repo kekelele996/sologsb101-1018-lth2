@@ -6,10 +6,13 @@ import type { Body } from '@/types/body';
 import type { Coat } from '@/types/coat';
 import type { Room } from '@/types/room';
 import type { Inspect } from '@/types/inspect';
+import type { ReworkAnchor } from '@/types/rework';
 import { BODY_MATERIAL_LABEL, BODY_SHAPE_LABEL } from '@/types/body';
 import { COAT_STATE_LABEL, PAINT_TYPE_LABEL } from '@/types/coat';
 import { ROOM_VERDICT_LABEL } from '@/types/room';
 import { INSPECT_VERDICT_LABEL } from '@/types/inspect';
+import { REWORK_STATUS_LABEL } from '@/types/rework';
+import { isCoatEffectivelyDone, taggedCoatsForAnchor } from './reworkView';
 import type { LacquerSnapshot } from './db';
 
 /** 触发浏览器下载 */
@@ -45,12 +48,13 @@ function csvCell(value: string | number | null): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
-/** 返工清单：定位到具体道次与荫房记录 */
+/** 返工清单：以质检室返工定位台账为准，列出定位、状态与待重确认道次 */
 export function buildReworkList(
   bodies: Body[],
   coats: Coat[],
   rooms: Room[],
   inspects: Inspect[],
+  anchors: ReworkAnchor[] = [],
 ): string {
   const lines: string[] = ['漆器髹涂返工清单', `生成时间：${new Date().toLocaleString('zh-CN')}`, ''];
   const reworks = inspects.filter((item) => item.verdict === 'rework');
@@ -60,6 +64,7 @@ export function buildReworkList(
   }
   reworks.forEach((inspect, index) => {
     const body = bodies.find((item) => item.id === inspect.bodyId);
+    const anchor = anchors.find((item) => item.inspectId === inspect.id && !item.settled);
     const coat = coats.find((item) => item.bodyId === inspect.bodyId && item.seq === inspect.defectCoatSeq);
     const room = rooms.find((item) => item.id === inspect.defectRoomId);
     lines.push(`${index + 1}. ${body ? `${body.code}（${BODY_MATERIAL_LABEL[body.material]}·${BODY_SHAPE_LABEL[body.shape]}）` : inspect.bodyId}`);
@@ -72,6 +77,12 @@ export function buildReworkList(
           : '未指定'
       }`,
     );
+    if (anchor) {
+      const tagged = taggedCoatsForAnchor(coats, anchor);
+      const pending = tagged.filter((item) => !isCoatEffectivelyDone(item)).map((item) => item.seq).join('、');
+      lines.push(`   定位标识：${anchor.id}　状态：${REWORK_STATUS_LABEL[anchor.status]}${anchor.settled ? '（已平账）' : ''}`);
+      lines.push(`   待工序台重确认道次：${pending || '已全部重确认，待质检复核'}`);
+    }
     lines.push(
       `   关联荫房：${
         room
@@ -90,15 +101,16 @@ export function exportReworkList(
   coats: Coat[],
   rooms: Room[],
   inspects: Inspect[],
+  anchors: ReworkAnchor[] = [],
 ): string {
   const filename = `漆器返工清单-${stampSuffix()}.txt`;
-  download(filename, buildReworkList(bodies, coats, rooms, inspects), 'text/plain;charset=utf-8');
+  download(filename, buildReworkList(bodies, coats, rooms, inspects, anchors), 'text/plain;charset=utf-8');
   return filename;
 }
 
 /** 工序台账 CSV（全部胎体 + 道次 + 荫房） */
 export function exportLedgerCsv(bodies: Body[], coats: Coat[], rooms: Room[]): string {
-  const header = ['胎体编号', '材质', '器型', '尺寸(mm)', '委托/藏家', '道次', '漆种', '色名', '涂刷日期', '湿膜(μm)', '道次状态', '待复检', '荫房日期', '温度(℃)', '湿度(%)', '判定'];
+  const header = ['胎体编号', '材质', '器型', '尺寸(mm)', '委托/藏家', '道次', '漆种', '色名', '涂刷日期', '湿膜(μm)', '道次状态', '待复检', '待重确认', '荫房日期', '温度(℃)', '湿度(%)', '判定'];
   const lines: string[] = [header.map(csvCell).join(',')];
   bodies.forEach((body) => {
     const bodyCoats = coats.filter((item) => item.bodyId === body.id).sort((a, b) => a.seq - b.seq);
@@ -121,6 +133,7 @@ export function exportLedgerCsv(bodies: Body[], coats: Coat[], rooms: Room[]): s
           coat ? coat.thicknessUm : '',
           coat ? COAT_STATE_LABEL[coat.state] : '',
           coat ? (coat.needRecheck ? '是' : '否') : '',
+          coat ? (coat.reconfirmBy.length > 0 ? `是(${coat.reconfirmBy.length})` : '否') : '',
           room ? room.date : '',
           room ? room.tempC : '',
           room ? room.humidityPct : '',

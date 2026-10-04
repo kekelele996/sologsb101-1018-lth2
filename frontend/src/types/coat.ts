@@ -1,6 +1,9 @@
 /**
- * 髹涂道次（Coat）数据模型
+ * 髹涂道次（Coat）数据模型 —— 髹涂工序台台账
  * 一件胎体上的逐道髹涂记录：漆种、色名、涂刷日期、湿膜厚度与状态推进。
+ *
+ * 权属约定：本台账只允许「工序台」（ACTOR_COAT，含打磨/荫房经授权的联动回写）写入；
+ * 质检室不得直接改道次（见 services/permission.ts）。
  */
 
 /** 漆种：生漆 / 色漆 / 罩漆 */
@@ -27,11 +30,18 @@ export interface Coat {
   state: CoatState;
   /** 荫房判定异常时回写的「待复检」标记 */
   needRecheck: boolean;
+  /**
+   * 待重确认标记：质检室把返工定位打到某一道后，
+   * 该道及其后序道次的 id 会进入此列；必须由工序台按当前顺序逐道重新确认后清除。
+   * 元素为返工定位（reworkAnchorId）。
+   */
+  reconfirmBy: string[];
   createdAt: number;
   updatedAt: number;
 }
 
-export type CoatDraft = Omit<Coat, 'id' | 'createdAt' | 'updatedAt'>;
+export type CoatDraft = Omit<Coat, 'id' | 'createdAt' | 'updatedAt' | 'reconfirmBy'> &
+  Partial<Pick<Coat, 'reconfirmBy'>>;
 
 export const PAINT_TYPE_LABEL: Record<PaintType, string> = {
   raw: '生漆',
@@ -91,5 +101,6 @@ export function createEmptyCoatDraft(bodyId: string, seq: number): CoatDraft {
     thicknessUm: 40,
     state: 'todo',
     needRecheck: false,
+    reconfirmBy: [],
   };
 }

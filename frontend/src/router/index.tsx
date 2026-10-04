@@ -1,6 +1,6 @@
 /**
- * 路由表（与提示词逐字一致）
- * /bodies、/coats、/rooms、/polish、/inlays、/export
+ * 路由表
+ * /bodies、/coats、/rooms、/polish、/inlays、/qc（质检室）、/export（数据导入导出）
  * 页面按路由懒加载，构建时自动分包。
  */
 import { Suspense, lazy, type ReactNode } from 'react';
@@ -13,6 +13,7 @@ const CoatBoard = lazy(() => import('../pages/CoatBoard'));
 const RoomLog = lazy(() => import('../pages/RoomLog'));
 const PolishBoard = lazy(() => import('../pages/PolishBoard'));
 const InlayBoard = lazy(() => import('../pages/InlayBoard'));
+const QualityRoom = lazy(() => import('../pages/QualityRoom'));
 const ExportView = lazy(() => import('../pages/ExportView'));
 
 /** ROUTES 常量：页面与导航统一引用，避免散落硬编码 */
@@ -22,6 +23,7 @@ export const ROUTES = {
   rooms: '/rooms',
   polish: '/polish',
   inlays: '/inlays',
+  qc: '/qc',
   export: '/export',
 } as const;
 
@@ -51,6 +53,7 @@ export const appRoutes: RouteObject[] = [
       { path: 'rooms', element: withSuspense(<RoomLog />) },
       { path: 'polish', element: withSuspense(<PolishBoard />) },
       { path: 'inlays', element: withSuspense(<InlayBoard />) },
+      { path: 'qc', element: withSuspense(<QualityRoom />) },
       { path: 'export', element: withSuspense(<ExportView />) },
       { path: '*', element: <Navigate to={ROUTES.bodies} replace /> },
     ],

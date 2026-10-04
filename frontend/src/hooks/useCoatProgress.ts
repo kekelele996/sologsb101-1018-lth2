@@ -10,6 +10,7 @@ import { dryingHours, roomStayHours } from '@/utils/humidity';
 import { ROOM_VERDICT_LABEL } from '@/types/room';
 import { COAT_STATE_LABEL } from '@/types/coat';
 import type { BodyStat } from '@/types/body';
+import { isCoatEffectivelyDone } from '@/utils/reworkView';
 
 const EMPTY_STAT: BodyStat = {
   bodyId: '',
@@ -52,8 +53,9 @@ export function useCoatProgress(): CoatProgressResult {
       const bodyRooms = rooms
         .filter((room) => room.bodyId === body.id)
         .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
-      const done = bodyCoats.filter((coat) => coat.state === 'done').length;
-      const current = bodyCoats.find((coat) => coat.state !== 'done');
+      // 质检判返工后挂重确认账的道次不算完成，必须工序台逐道重确认后才恢复
+      const done = bodyCoats.filter(isCoatEffectivelyDone).length;
+      const current = bodyCoats.find((coat) => !isCoatEffectivelyDone(coat));
       const lastRoom = bodyRooms[bodyRooms.length - 1];
       const overCount = bodyRooms.filter((room) => room.verdict !== 'suitable').length;
       const waitHours = lastRoom

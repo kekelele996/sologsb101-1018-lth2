@@ -36,7 +36,7 @@ import StageTag from '@/components/common/StageTag';
 import { useCoatProgress } from '@/hooks/useCoatProgress';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
-import {
+import { useQcStore } from '@/stores/qcStore';import {
   COAT_STATE_LABEL,
   COAT_STATE_OPTIONS,
   COLOR_NAME_OPTIONS,
@@ -49,7 +49,9 @@ import {
   type PaintType,
 } from '@/types/coat';
 import { BODY_SHAPE_LABEL } from '@/types/body';
+import { REWORK_STATUS_COLOR, REWORK_STATUS_LABEL } from '@/types/rework';
 import { suggestIntervalHours } from '@/utils/humidity';
+import { isCoatEffectivelyDone } from '@/utils/reworkView';
 
 const FILTER_KEYS = ['paintType', 'state'] as const;
 
@@ -72,8 +74,13 @@ export default function CoatBoard() {
   const batchUpdate = useCoatStore((state) => state.batchUpdate);
   const advanceState = useCoatStore((state) => state.advanceState);
   const reorderCoats = useCoatStore((state) => state.reorderCoats);
+  const reconfirmRework = useCoatStore((state) => state.reconfirmRework);
+  const retryAnchorReturn = useCoatStore((state) => state.retryAnchorReturn);
   const nextSeq = useCoatStore((state) => state.nextSeq);
   const suggestForBody = useCoatStore((state) => state.suggestForBody);
+
+  const anchors = useQcStore((state) => state.anchors);
+  const loadQc = useQcStore((state) => state.loadQc);
 
   const { progressOf, currentCoatText, totals } = useCoatProgress();
   const url = useFilterQuery(FILTER_KEYS);
@@ -116,6 +123,15 @@ export default function CoatBoard() {
   const suggestion = bodyId.length > 0 ? suggestForBody(bodyId) : null;
   const stat = bodyId.length > 0 ? progressOf(bodyId) : null;
 
+  const bodyOpenAnchors = useMemo(
+    () => anchors.filter((anchor) => anchor.bodyId === bodyId && !anchor.settled),
+    [anchors, bodyId],
+  );
+  const bodyReconfirmCoats = useMemo(
+    () => bodyCoats.filter((coat) => coat.reconfirmBy.length > 0),
+    [bodyCoats],
+  );
+
   const openCreate = (): void => {
     if (!bodyId) {
       message.warning('请先选择或新建胎体');
@@ -148,16 +164,21 @@ export default function CoatBoard() {
     const values = await form.validateFields();
     const payload: CoatDraft = { ...values };
     if (editing) {
-      await updateCoat(editing.id, payload);
-      message.success(`已更新第 ${payload.seq} 道工序`);
+      const notice = await updateCoat(editing.id, payload);
+      if (notice.ok) message.success(`已更新第 ${payload.seq} 道工序`);
+      else message.error(notice.message);
     } else {
-      await createCoat(payload);
-      message.success(`已新增第 ${payload.seq} 道工序`);
+      const notice = await createCoat(payload);
+      if (notice.ok) {
+        message.success(notice.message || `已新增第 ${payload.seq} 道工序`);
+        await loadQc();
+      }
+      else message.error(notice.message);
     }
     setOpen(false);
   };
 
-  /** 拖拽重排：按落点重排并落库重编号 */
+  /** 拖拽重排：按落点重排并落库重编号；调序会把质检侧旧定位退回待认领 */
   const handleDrop = async (targetId: string): Promise<void> => {
     setOverId(null);
     if (!dragId || dragId === targetId || !bodyId) {
@@ -173,19 +194,32 @@ export default function CoatBoard() {
     }
     const [moved] = ids.splice(from, 1);
     ids.splice(to, 0, moved as string);
-    await reorderCoats(bodyId, ids);
+    const notice = await reorderCoats(bodyId, ids);
     setDragId(null);
-    message.success('道次顺序已更新并重编号');
+    if (notice.ok) {
+      message.success(notice.message || '道次顺序已更新并重编号');
+      await loadQc();
+    } else message.error(notice.message);
   };
 
-  /** 状态推进校验：前一道未完成时禁止进入下一道 */
+  /** 状态推进校验：前一道未有效完成时禁止进入下一道；挂返工账的末步必须走「返工重确认」 */
   const handleAdvance = async (coat: Coat): Promise<void> => {
     const previous = bodyCoats.find((item) => item.seq === coat.seq - 1);
-    if (previous && previous.state !== 'done') {
-      message.warning(`第 ${previous.seq} 道尚未完成，禁止进入第 ${coat.seq} 道`);
+    if (previous && !isCoatEffectivelyDone(previous)) {
+      message.warning(`第 ${previous.seq} 道尚未（重）确认完成，禁止进入第 ${coat.seq} 道`);
       return;
     }
-    await advanceState(coat.id);
+    const notice = await advanceState(coat.id);
+    if (!notice.ok) message.error(notice.message);
+  };
+
+  /** 工序台对返工挂账道次按当前顺序逐道重确认 */
+  const handleReconfirm = async (coat: Coat, anchorId: string): Promise<void> => {
+    const notice = await reconfirmRework(coat.id, anchorId);
+    if (notice.ok) {
+      message.success(notice.message);
+      await loadQc();
+    } else message.error(notice.message);
   };
 
   const columns: ColumnsType<Coat> = [
@@ -212,10 +246,26 @@ export default function CoatBoard() {
     {
       title: '道次',
       dataIndex: 'seq',
-      width: 90,
+      width: 120,
       sorter: (a, b) => a.seq - b.seq,
       render: (seq: number, record) => (
-        <StageTag state={record.state} seq={seq} needRecheck={record.needRecheck} />
+        <Space size={2} direction="vertical">
+          <StageTag state={record.state} seq={seq} needRecheck={record.needRecheck} />
+          {record.reconfirmBy.length > 0 ? (
+            <Space size={2} wrap>
+              {record.reconfirmBy.map((anchorId) => {
+                const anchor = anchors.find((item) => item.id === anchorId);
+                return (
+                  <Tooltip key={anchorId} title={anchor ? `${REWORK_STATUS_LABEL[anchor.status]}：${anchor.note}` : anchorId}>
+                    <Tag color={anchor ? REWORK_STATUS_COLOR[anchor.status] : 'default'} style={{ fontSize: 11, marginInlineEnd: 0 }}>
+                      返工重确认
+                    </Tag>
+                  </Tooltip>
+                );
+              })}
+            </Space>
+          ) : null}
+        </Space>
       ),
     },
     { title: '漆种', dataIndex: 'paintType', width: 100, render: (value: PaintType) => <Tag>{PAINT_TYPE_LABEL[value]}</Tag> },
@@ -230,21 +280,41 @@ export default function CoatBoard() {
     {
       title: '操作',
       key: 'action',
-      width: 220,
+      width: 260,
       render: (_value, record) => (
         <Space size={4} wrap>
           <Button size="small" type="link" onClick={() => void handleAdvance(record)}>
             推进状态
           </Button>
+          {record.reconfirmBy.length > 0 ? (
+            <Popconfirm
+              title="返工重确认"
+              description={`按当前顺序确认第 ${record.seq} 道已重新做到位，并置为已完成？`}
+              okText="确认重确认"
+              cancelText="取消"
+              onConfirm={() => void handleReconfirm(record, record.reconfirmBy[0] as string)}
+            >
+              <Button size="small" type="link" danger>
+                返工重确认
+              </Button>
+            </Popconfirm>
+          ) : null}
           <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
             编辑
           </Button>
           <Popconfirm
             title="删除该道次"
-            description="删除后其余道次会自动重编号。"
+            description="删除后其余道次自动重编号，质检侧旧定位退回待认领。"
             okText="确认"
             cancelText="取消"
-            onConfirm={() => void removeCoat(record.id).then(() => message.success('已删除该道次'))}
+            onConfirm={() =>
+              void removeCoat(record.id).then(async (notice) => {
+                if (notice.ok) {
+                  message.success(notice.message);
+                  await loadQc();
+                } else message.error(notice.message);
+              })
+            }
           >
             <Button size="small" type="link" danger icon={<DeleteOutlined />}>
               删除
@@ -286,6 +356,40 @@ export default function CoatBoard() {
         <StatBadge label="全局待复检" value={totals.recheck} suffix="道" tone="danger" />
         <StatBadge label="荫干等待" value={stat?.dryingHours ?? 0} suffix="小时" tone="info" />
       </div>
+
+      {bodyOpenAnchors.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`质检室有 ${bodyOpenAnchors.length} 条返工定位：${bodyReconfirmCoats.length} 道需按当前顺序逐道重确认（重确认全部完成前，本件胎体质检不再判合格）`}
+          description={
+            <Space size={6} wrap>
+              {bodyOpenAnchors.map((anchor) => (
+                <Tooltip key={anchor.id} title={anchor.note}>
+                  <Tag color={REWORK_STATUS_COLOR[anchor.status]}>
+                    {anchor.id} · 第 {anchor.coatSeq} 道 · {REWORK_STATUS_LABEL[anchor.status]}
+                  </Tag>
+                </Tooltip>
+              ))}
+              <Button
+                size="small"
+                type="link"
+                onClick={() =>
+                  void retryAnchorReturn(bodyId).then(async (notice) => {
+                    if (notice.ok) {
+                      message.success(notice.message);
+                      await loadQc();
+                    } else message.error(notice.message);
+                  })
+                }
+              >
+                重新对账
+              </Button>
+            </Space>
+          }
+        />
+      ) : null}
 
       {suggestion && suggestion.sourceCode ? (
         <Alert
@@ -331,9 +435,13 @@ export default function CoatBoard() {
               size="small"
               disabled={selectedIds.length === 0}
               onClick={() =>
-                void batchUpdate(selectedIds, { paintType: batchPaint }).then(() => {
-                  message.success(`已批量改为${PAINT_TYPE_LABEL[batchPaint]}`);
-                  setSelectedIds([]);
+                void batchUpdate(selectedIds, { paintType: batchPaint }).then((notice) => {
+                  if (notice.ok) {
+                    message.success(`已批量改为${PAINT_TYPE_LABEL[batchPaint]}`);
+                    setSelectedIds([]);
+                  } else {
+                    message.error(notice.message);
+                  }
                 })
               }
             >
@@ -350,9 +458,13 @@ export default function CoatBoard() {
               size="small"
               disabled={selectedIds.length === 0}
               onClick={() =>
-                void batchUpdate(selectedIds, { state: batchState }).then(() => {
-                  message.success(`已批量改为${COAT_STATE_LABEL[batchState]}`);
-                  setSelectedIds([]);
+                void batchUpdate(selectedIds, { state: batchState }).then((notice) => {
+                  if (notice.ok) {
+                    message.success(`已批量改为${COAT_STATE_LABEL[batchState]}`);
+                    setSelectedIds([]);
+                  } else {
+                    message.error(notice.message);
+                  }
                 })
               }
             >

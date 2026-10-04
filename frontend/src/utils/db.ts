@@ -1,7 +1,10 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据结构版本号与升级迁移逻辑（v1 → v2：Coat 增加 paintType 索引并回填历史记录）
- * - 六张业务表的增删改查与整库导入导出
+ * - 数据结构版本号与升级迁移逻辑
+ *   v1 → v2：Coat 增加 paintType 索引并回填历史记录
+ *   v2 → v3：质检室 / 工序台两摊分账 —— 新增 reworkAnchors（返工定位固定标识）、
+ *            migrateIssues（补不出标识的旧返工单列）；coats 增加 reconfirmBy 重确认挂账
+ * - 八张业务表的增删改查与整库导入导出
  * - 首次打开自动播种互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
  */
@@ -12,12 +15,14 @@ import type { Room } from '@/types/room';
 import type { Polish } from '@/types/polish';
 import type { Inlay } from '@/types/inlay';
 import type { Inspect } from '@/types/inspect';
+import type { ReworkAnchor } from '@/types/rework';
+import type { MigrateIssue } from '@/types/migrateIssue';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gblacquer';
 
 /** 当前数据结构版本号 */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -84,6 +89,8 @@ class LacquerDatabase extends Dexie {
   polishes!: Table<Polish, string>;
   inlays!: Table<Inlay, string>;
   inspects!: Table<Inspect, string>;
+  reworkAnchors!: Table<ReworkAnchor, string>;
+  migrateIssues!: Table<MigrateIssue, string>;
 
   constructor() {
     super(DB_NAME);
@@ -99,6 +106,16 @@ class LacquerDatabase extends Dexie {
     });
 
     // v2：Coat 增加 paintType 索引；历史记录缺少 paintType 时按「生漆」回填
+    this.version(2).stores({
+      bodies: 'id, code, material, shape, state, updatedAt',
+      coats: 'id, bodyId, seq, paintType, state, needRecheck, updatedAt',
+      rooms: 'id, bodyId, date, verdict, updatedAt',
+      polishes: 'id, bodyId, seq, method, updatedAt',
+      inlays: 'id, bodyId, type, position, updatedAt',
+      inspects: 'id, bodyId, verdict, date, updatedAt',
+    });
+
+    // v3：质检室 / 工序台两摊分账
     this.version(DB_SCHEMA_VERSION)
       .stores({
         bodies: 'id, code, material, shape, state, updatedAt',
@@ -107,8 +124,11 @@ class LacquerDatabase extends Dexie {
         polishes: 'id, bodyId, seq, method, updatedAt',
         inlays: 'id, bodyId, type, position, updatedAt',
         inspects: 'id, bodyId, verdict, date, updatedAt',
+        reworkAnchors: 'id, bodyId, inspectId, status, settled, updatedAt',
+        migrateIssues: 'id, bodyId, inspectId, resolved, createdAt',
       })
       .upgrade(async (tx) => {
+        // 1) coats 结构补齐：v2 回填一次 paintType 等；v3 增加 reconfirmBy 重确认挂账
         await tx
           .table<Coat>('coats')
           .toCollection()
@@ -117,15 +137,96 @@ class LacquerDatabase extends Dexie {
             if (!legal.includes(coat.paintType)) coat.paintType = 'raw';
             if (typeof coat.needRecheck !== 'boolean') coat.needRecheck = false;
             if (typeof coat.thicknessUm !== 'number') coat.thicknessUm = 40;
+            if (!Array.isArray(coat.reconfirmBy)) coat.reconfirmBy = [];
           });
+
+        // 2) 旧返工质检记录 → 按当时道次顺序补返工定位固定标识；补不出的单列 migrateIssues
+        const inspectTable = tx.table<Inspect>('inspects');
+        const coatTable = tx.table<Coat>('coats');
+        const bodyTable = tx.table<Body>('bodies');
+        const anchorTable = tx.table<ReworkAnchor>('reworkAnchors');
+        const issueTable = tx.table<MigrateIssue>('migrateIssues');
+        const now = Date.now();
+
+        const legacyReworks = await inspectTable
+          .filter((inspect) => inspect.verdict === 'rework' && inspect.defectCoatSeq !== null)
+          .toArray();
+
+        for (const inspect of legacyReworks) {
+          const seq = inspect.defectCoatSeq as number;
+          // 按「当时的道次顺序」（迁移发生前库里现存顺序）取该胎体道次
+          const bodyCoats = (await coatTable.where('bodyId').equals(inspect.bodyId).toArray()).sort(
+            (a, b) => a.seq - b.seq,
+          );
+          const body = await bodyTable.get(inspect.bodyId);
+          const target = bodyCoats.find((coat) => coat.seq === seq);
+
+          if (!target) {
+            await issueTable.put({
+              id: `mig_${inspect.id}`,
+              kind: 'anchor-unmatched',
+              inspectId: inspect.id,
+              bodyId: inspect.bodyId,
+              bodyCode: body?.code ?? '',
+              coatSeq: seq,
+              reason: `旧质检记录定位到第 ${seq} 道，但按当时道次顺序该胎体只有 ${bodyCoats.length} 道，补不出固定标识`,
+              createdAt: now,
+              resolved: false,
+            });
+            continue;
+          }
+
+          const anchorId = `rwa_${inspect.id}`;
+          // 迁移时命中道及后序道次若已是「已完成」，与返工结论矛盾，打回待打磨并挂重确认账
+          await coatTable.bulkPut(
+            bodyCoats.map((coat) => {
+              if (coat.seq < seq) return coat;
+              const reconfirmBy = Array.isArray(coat.reconfirmBy)
+                ? coat.reconfirmBy.includes(anchorId)
+                  ? coat.reconfirmBy
+                  : [...coat.reconfirmBy, anchorId]
+                : [anchorId];
+              return {
+                ...coat,
+                state: coat.state === 'done' ? ('toPolish' as Coat['state']) : coat.state,
+                reconfirmBy,
+                updatedAt: now,
+              };
+            }),
+          );
+
+          await anchorTable.put({
+            id: anchorId,
+            bodyId: inspect.bodyId,
+            bodyCode: body?.code ?? '',
+            coatSeq: seq,
+            status: 'active',
+            inspectId: inspect.id,
+            defectRoomId: inspect.defectRoomId ?? null,
+            note: '旧数据升级：按当时道次顺序补固定标识，待工序台按现顺序重确认',
+            reconfirmed: false,
+            settled: false,
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
       });
   }
 }
 
 export const db = new LacquerDatabase();
 
-/** 六张业务表清单，事务中统一引用 */
-const TABLE_LIST = [db.bodies, db.coats, db.rooms, db.polishes, db.inlays, db.inspects];
+/** 八张业务表清单，事务中统一引用 */
+const TABLE_LIST = [
+  db.bodies,
+  db.coats,
+  db.rooms,
+  db.polishes,
+  db.inlays,
+  db.inspects,
+  db.reworkAnchors,
+  db.migrateIssues,
+];
 
 /** 生成主键：短前缀 + 时间戳 + 随机串，避免多标签页写入冲突 */
 export function createId(prefix: string): string {
@@ -143,7 +244,7 @@ export async function initDatabase(): Promise<void> {
 }
 
 /* ------------------------------ 播种数据 ------------------------------ */
-/* 三层互相引用：Body →（Coat / Room / Polish / Inlay）→ Inspect，id 固定便于深链命中 */
+/* 三层互相引用：Body →（Coat / Room / Polish / Inlay）→ Inspect / ReworkAnchor，id 固定便于深链命中 */
 
 export async function seedDatabase(): Promise<void> {
   const now = Date.now();
@@ -184,14 +285,14 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   const coats: Coat[] = [
-    { id: 'coat_0101', bodyId: 'body_01', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-03-02', thicknessUm: 40, state: 'done', needRecheck: false, createdAt: now - 86400000 * 11, updatedAt: now - 86400000 * 10 },
-    { id: 'coat_0102', bodyId: 'body_01', seq: 2, paintType: 'color', colorName: '朱红', coatDate: '2026-03-06', thicknessUm: 45, state: 'toPolish', needRecheck: true, createdAt: now - 86400000 * 7, updatedAt: now - 86400000 * 2 },
-    { id: 'coat_0103', bodyId: 'body_01', seq: 3, paintType: 'topcoat', colorName: '推光本色', coatDate: '2026-03-12', thicknessUm: 30, state: 'todo', needRecheck: false, createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 6 },
-    { id: 'coat_0201', bodyId: 'body_02', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-03-03', thicknessUm: 35, state: 'done', needRecheck: false, createdAt: now - 86400000 * 8, updatedAt: now - 86400000 * 7 },
-    { id: 'coat_0202', bodyId: 'body_02', seq: 2, paintType: 'color', colorName: '赭石', coatDate: '2026-03-08', thicknessUm: 42, state: 'coated', needRecheck: true, createdAt: now - 86400000 * 5, updatedAt: now - 86400000 },
-    { id: 'coat_0301', bodyId: 'body_03', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-02-10', thicknessUm: 38, state: 'done', needRecheck: false, createdAt: now - 86400000 * 26, updatedAt: now - 86400000 * 25 },
-    { id: 'coat_0302', bodyId: 'body_03', seq: 2, paintType: 'color', colorName: '石绿', coatDate: '2026-02-18', thicknessUm: 44, state: 'done', needRecheck: false, createdAt: now - 86400000 * 20, updatedAt: now - 86400000 * 18 },
-    { id: 'coat_0303', bodyId: 'body_03', seq: 3, paintType: 'topcoat', colorName: '描金', coatDate: '2026-02-26', thicknessUm: 28, state: 'done', needRecheck: false, createdAt: now - 86400000 * 14, updatedAt: now - 86400000 * 4 },
+    { id: 'coat_0101', bodyId: 'body_01', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-03-02', thicknessUm: 40, state: 'done', needRecheck: false, reconfirmBy: [], createdAt: now - 86400000 * 11, updatedAt: now - 86400000 * 10 },
+    { id: 'coat_0102', bodyId: 'body_01', seq: 2, paintType: 'color', colorName: '朱红', coatDate: '2026-03-06', thicknessUm: 45, state: 'toPolish', needRecheck: true, reconfirmBy: [], createdAt: now - 86400000 * 7, updatedAt: now - 86400000 * 2 },
+    { id: 'coat_0103', bodyId: 'body_01', seq: 3, paintType: 'topcoat', colorName: '推光本色', coatDate: '2026-03-12', thicknessUm: 30, state: 'todo', needRecheck: false, reconfirmBy: [], createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 6 },
+    { id: 'coat_0201', bodyId: 'body_02', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-03-03', thicknessUm: 35, state: 'done', needRecheck: false, reconfirmBy: ['rwa_inspect_0102'], createdAt: now - 86400000 * 8, updatedAt: now - 86400000 * 2 },
+    { id: 'coat_0202', bodyId: 'body_02', seq: 2, paintType: 'color', colorName: '赭石', coatDate: '2026-03-08', thicknessUm: 42, state: 'coated', needRecheck: true, reconfirmBy: ['rwa_inspect_0102'], createdAt: now - 86400000 * 5, updatedAt: now - 86400000 },
+    { id: 'coat_0301', bodyId: 'body_03', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-02-10', thicknessUm: 38, state: 'done', needRecheck: false, reconfirmBy: [], createdAt: now - 86400000 * 26, updatedAt: now - 86400000 * 25 },
+    { id: 'coat_0302', bodyId: 'body_03', seq: 2, paintType: 'color', colorName: '石绿', coatDate: '2026-02-18', thicknessUm: 44, state: 'done', needRecheck: false, reconfirmBy: [], createdAt: now - 86400000 * 20, updatedAt: now - 86400000 * 18 },
+    { id: 'coat_0303', bodyId: 'body_03', seq: 3, paintType: 'topcoat', colorName: '描金', coatDate: '2026-02-26', thicknessUm: 28, state: 'done', needRecheck: false, reconfirmBy: [], createdAt: now - 86400000 * 14, updatedAt: now - 86400000 * 4 },
   ];
 
   const rooms: Room[] = [
@@ -217,8 +318,29 @@ export async function seedDatabase(): Promise<void> {
 
   const inspects: Inspect[] = [
     { id: 'inspect_0101', bodyId: 'body_03', verdict: 'pass', defectNote: '', inspector: '周衡', date: '2026-03-02', defectCoatSeq: null, defectRoomId: null, createdAt: now - 86400000 * 4, updatedAt: now - 86400000 * 4 },
-    { id: 'inspect_0102', bodyId: 'body_02', verdict: 'rework', defectNote: '起皱（荫干过快）', inspector: '周衡', date: '2026-03-08', defectCoatSeq: 2, defectRoomId: 'room_0201', createdAt: now - 86400000, updatedAt: now - 86400000 },
+    { id: 'inspect_0102', bodyId: 'body_02', verdict: 'rework', defectNote: '起皱（荫干过快）', inspector: '周衡', date: '2026-03-08', defectCoatSeq: 1, defectRoomId: 'room_0201', createdAt: now - 86400000, updatedAt: now - 86400000 },
   ];
+
+  // 质检室返工定位台账（与 inspect_0102 固定对应 rwa_inspect_0102）
+  const reworkAnchors: ReworkAnchor[] = [
+    {
+      id: 'rwa_inspect_0102',
+      bodyId: 'body_02',
+      bodyCode: 'LQ-2402',
+      coatSeq: 1,
+      status: 'active',
+      inspectId: 'inspect_0102',
+      defectRoomId: 'room_0201',
+      note: '质检判返工：第 1 道起皱，第 1、2 道打回，待工序台按当前顺序逐道重确认',
+      reconfirmed: false,
+      settled: false,
+      createdAt: now - 86400000,
+      updatedAt: now - 86400000,
+    },
+  ];
+
+  // 全新库不产生升级异常；该表仅在 v2→v3 迁移补不出标识时才有记录
+  const migrateIssues: MigrateIssue[] = [];
 
   await db.transaction('rw', TABLE_LIST, async () => {
     await db.bodies.bulkPut(bodies);
@@ -227,6 +349,8 @@ export async function seedDatabase(): Promise<void> {
     await db.polishes.bulkPut(polishes);
     await db.inlays.bulkPut(inlays);
     await db.inspects.bulkPut(inspects);
+    await db.reworkAnchors.bulkPut(reworkAnchors);
+    await db.migrateIssues.bulkPut(migrateIssues);
   });
 }
 
@@ -242,16 +366,20 @@ export interface LacquerSnapshot {
   polishes: Polish[];
   inlays: Inlay[];
   inspects: Inspect[];
+  reworkAnchors: ReworkAnchor[];
+  migrateIssues: MigrateIssue[];
 }
 
 export async function exportSnapshot(): Promise<LacquerSnapshot> {
-  const [bodies, coats, rooms, polishes, inlays, inspects] = await Promise.all([
+  const [bodies, coats, rooms, polishes, inlays, inspects, reworkAnchors, migrateIssues] = await Promise.all([
     db.bodies.toArray(),
     db.coats.toArray(),
     db.rooms.toArray(),
     db.polishes.toArray(),
     db.inlays.toArray(),
     db.inspects.toArray(),
+    db.reworkAnchors.toArray(),
+    db.migrateIssues.toArray(),
   ]);
   return {
     app: DB_NAME,
@@ -263,6 +391,8 @@ export async function exportSnapshot(): Promise<LacquerSnapshot> {
     polishes,
     inlays,
     inspects,
+    reworkAnchors,
+    migrateIssues,
   };
 }
 
@@ -278,15 +408,25 @@ export function validateSnapshot(input: unknown): string {
   return '';
 }
 
+/** 导入旧版本备份时给新字段兜底，避免 v2 备份导入 v3 后缺列 */
+function normalizeCoat(coats: Coat[]): Coat[] {
+  return coats.map((coat) => ({
+    ...coat,
+    reconfirmBy: Array.isArray(coat.reconfirmBy) ? coat.reconfirmBy : [],
+  }));
+}
+
 export async function importSnapshot(snapshot: LacquerSnapshot): Promise<void> {
   await clearAllTables();
   await db.transaction('rw', TABLE_LIST, async () => {
     await db.bodies.bulkPut(snapshot.bodies);
-    await db.coats.bulkPut(snapshot.coats);
+    await db.coats.bulkPut(normalizeCoat(snapshot.coats));
     await db.rooms.bulkPut(snapshot.rooms);
     await db.polishes.bulkPut(snapshot.polishes);
     await db.inlays.bulkPut(snapshot.inlays);
     await db.inspects.bulkPut(snapshot.inspects);
+    if (Array.isArray(snapshot.reworkAnchors)) await db.reworkAnchors.bulkPut(snapshot.reworkAnchors);
+    if (Array.isArray(snapshot.migrateIssues)) await db.migrateIssues.bulkPut(snapshot.migrateIssues);
   });
 }
 
@@ -299,6 +439,8 @@ export async function clearAllTables(): Promise<void> {
       db.polishes.clear(),
       db.inlays.clear(),
       db.inspects.clear(),
+      db.reworkAnchors.clear(),
+      db.migrateIssues.clear(),
     ]);
   });
 }
@@ -310,15 +452,17 @@ export async function resetDatabase(): Promise<void> {
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [bodies, coats, rooms, polishes, inlays, inspects] = await Promise.all([
+  const [bodies, coats, rooms, polishes, inlays, inspects, reworkAnchors, migrateIssues] = await Promise.all([
     db.bodies.count(),
     db.coats.count(),
     db.rooms.count(),
     db.polishes.count(),
     db.inlays.count(),
     db.inspects.count(),
+    db.reworkAnchors.count(),
+    db.migrateIssues.count(),
   ]);
-  return { bodies, coats, rooms, polishes, inlays, inspects };
+  return { bodies, coats, rooms, polishes, inlays, inspects, reworkAnchors, migrateIssues };
 }
 
 /* ------------------------------ 级联删除 ------------------------------ */
@@ -329,6 +473,8 @@ export async function removeBodyCascade(bodyId: string): Promise<void> {
     await db.rooms.where('bodyId').equals(bodyId).delete();
     await db.polishes.where('bodyId').equals(bodyId).delete();
     await db.inlays.where('bodyId').equals(bodyId).delete();
+    await db.reworkAnchors.where('bodyId').equals(bodyId).delete();
+    await db.migrateIssues.where('bodyId').equals(bodyId).delete();
     await db.inspects.where('bodyId').equals(bodyId).delete();
     await db.bodies.delete(bodyId);
   });

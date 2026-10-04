@@ -1,12 +1,21 @@
 /**
- * 髹涂道次状态管理（Zustand）
- * 维护道次顺序与状态推进，支持拖拽重排落库重编号、批量改漆种与状态。
+ * 髹涂道次状态管理（Zustand）—— 髹涂工序台那份台账
+ * 维护道次顺序与状态推进；所有写入只走 coatService（ACTOR_COAT），
+ * 涉及质检侧的调序/撤道/新增/重确认联动走 services/workflow（分步提交、单侧回滚）。
  */
 import { create } from 'zustand';
-import { db, createId } from '@/utils/db';
+import { db } from '@/utils/db';
 import type { Coat, CoatDraft, CoatState, PaintType } from '@/types/coat';
 import { nextCoatState } from '@/types/coat';
 import { suggestIntervalHours, suggestPaintType } from '@/utils/humidity';
+import { ACTOR_COAT } from '@/services/permission';
+import {
+  advanceCoatState,
+  batchUpdateCoats,
+  markCoatsRecheck,
+  updateCoat,
+} from '@/services/coatService';
+import { addCoat, changeCoatOrder, confirmCoatRework, retryReturnAnchors } from '@/services/workflow';
 import { useBodyStore } from './bodyStore';
 
 export interface PaintSuggestion {
@@ -16,6 +25,12 @@ export interface PaintSuggestion {
   sourceColor: string;
 }
 
+/** 跨侧工作流执行结果提示（失败侧 + 文案），由页面弹 message */
+export interface CoatActionNotice {
+  ok: boolean;
+  message: string;
+}
+
 interface CoatStoreState {
   coats: Coat[];
   loading: boolean;
@@ -23,13 +38,17 @@ interface CoatStoreState {
   error: string;
   loadCoats: () => Promise<void>;
   coatsOfBody: (bodyId: string) => Coat[];
-  createCoat: (draft: CoatDraft) => Promise<Coat>;
-  updateCoat: (id: string, patch: Partial<Coat>) => Promise<void>;
-  removeCoat: (id: string) => Promise<void>;
-  batchUpdate: (ids: string[], patch: Partial<Coat>) => Promise<void>;
-  advanceState: (id: string) => Promise<void>;
-  markRecheck: (bodyId: string, recheck: boolean) => Promise<void>;
-  reorderCoats: (bodyId: string, orderedIds: string[]) => Promise<void>;
+  createCoat: (draft: CoatDraft) => Promise<CoatActionNotice>;
+  updateCoat: (id: string, patch: Partial<Coat>) => Promise<CoatActionNotice>;
+  removeCoat: (id: string) => Promise<CoatActionNotice>;
+  batchUpdate: (ids: string[], patch: Partial<Coat>) => Promise<CoatActionNotice>;
+  advanceState: (id: string) => Promise<CoatActionNotice>;
+  markRecheck: (bodyId: string, recheck: boolean) => Promise<CoatActionNotice>;
+  reorderCoats: (bodyId: string, orderedIds: string[]) => Promise<CoatActionNotice>;
+  /** 工序台对返工挂账道次按当前顺序逐道重确认（先工序侧、后质检侧平账标记） */
+  reconfirmRework: (coatId: string, anchorId: string) => Promise<CoatActionNotice>;
+  /** 单侧失败后的补偿：重试把该胎体旧定位退回待认领 */
+  retryAnchorReturn: (bodyId: string) => Promise<CoatActionNotice>;
   nextSeq: (bodyId: string) => number;
   /** 同器型自动带出上次漆种与间隔建议 */
   suggestForBody: (bodyId: string) => PaintSuggestion;
@@ -59,75 +78,88 @@ export const useCoatStore = create<CoatStoreState>((set, get) => ({
   },
 
   async createCoat(draft) {
-    const now = Date.now();
-    const row: Coat = { ...draft, id: createId('coat'), createdAt: now, updatedAt: now };
-    await db.coats.put(row);
+    // 走 saga：先工序侧新增，再到质检侧按「胎体编号+道次序号」对账挂起定位
+    const result = await addCoat(draft);
     await get().loadCoats();
-    return row;
+    return { ok: result.ok, message: result.message };
   },
 
   async updateCoat(id, patch) {
-    await db.coats.update(id, { ...patch, updatedAt: Date.now() } as never);
-    await get().loadCoats();
+    try {
+      await updateCoat(ACTOR_COAT, id, patch);
+      await get().loadCoats();
+      return { ok: true, message: '已保存' };
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : '道次保存失败' };
+    }
   },
 
   async removeCoat(id) {
     const target = get().coats.find((coat) => coat.id === id);
-    await db.coats.delete(id);
-    if (target) {
-      // 删除后按序重编号，保持 seq 连续
-      const rest = get()
-        .coats.filter((coat) => coat.bodyId === target.bodyId && coat.id !== id)
-        .sort((a, b) => a.seq - b.seq)
-        .map((coat, index) => ({ ...coat, seq: index + 1, updatedAt: Date.now() }));
-      if (rest.length > 0) await db.coats.bulkPut(rest);
-    }
+    if (!target) return { ok: false, message: '道次不存在' };
+    // 走 saga：先工序侧撤道重编号，再把质检侧旧定位退回待认领（质检侧失败只报失败侧）
+    const result = await changeCoatOrder('remove', { bodyId: target.bodyId, coatId: id });
     await get().loadCoats();
+    return { ok: result.ok, message: result.message };
   },
 
   async batchUpdate(ids, patch) {
-    if (ids.length === 0) return;
-    const now = Date.now();
-    const rows = get()
-      .coats.filter((coat) => ids.includes(coat.id))
-      .map((coat) => ({ ...coat, ...patch, updatedAt: now }));
-    await db.coats.bulkPut(rows);
-    await get().loadCoats();
+    if (ids.length === 0) return { ok: true, message: '' };
+    try {
+      await batchUpdateCoats(ACTOR_COAT, ids, patch);
+      await get().loadCoats();
+      return { ok: true, message: '批量更新完成' };
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : '批量更新失败' };
+    }
   },
 
   async advanceState(id) {
     const coat = get().coats.find((item) => item.id === id);
-    if (!coat) return;
+    if (!coat) return { ok: false, message: '道次不存在' };
     const next = nextCoatState(coat.state);
-    if (next === coat.state) return;
-    await get().updateCoat(id, { state: next });
+    if (next === coat.state) return { ok: true, message: '' };
+    try {
+      await advanceCoatState(ACTOR_COAT, id, next);
+      await get().loadCoats();
+      return { ok: true, message: `已推进为${next === 'done' ? '已完成' : '下一阶段'}` };
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : '状态推进失败' };
+    }
   },
 
   async markRecheck(bodyId, recheck) {
-    const affected = get().coats.filter((coat) => coat.bodyId === bodyId && coat.state !== 'done');
-    if (affected.length === 0) return;
-    const now = Date.now();
-    await db.coats.bulkPut(affected.map((coat) => ({ ...coat, needRecheck: recheck, updatedAt: now })));
-    await get().loadCoats();
+    // 工序侧内部联动（荫房页），仍然是工序台身份
+    try {
+      await markCoatsRecheck(ACTOR_COAT, bodyId, recheck);
+      await get().loadCoats();
+      return { ok: true, message: '' };
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : '待复检回写失败' };
+    }
   },
 
   async reorderCoats(bodyId, orderedIds) {
-    const indexOf = new Map(orderedIds.map((id, index) => [id, index]));
-    const rows = get()
-      .coats.filter((coat) => coat.bodyId === bodyId)
-      .sort((a, b) => {
-        const ai = indexOf.has(a.id) ? (indexOf.get(a.id) as number) : Number.MAX_SAFE_INTEGER;
-        const bi = indexOf.has(b.id) ? (indexOf.get(b.id) as number) : Number.MAX_SAFE_INTEGER;
-        return ai - bi;
-      })
-      .map((coat, index) => ({ ...coat, seq: index + 1, updatedAt: Date.now() }));
-    await db.coats.bulkPut(rows);
+    // 走 saga：调序重编号后质检侧旧定位退回待认领
+    const result = await changeCoatOrder('reorder', { bodyId, orderedIds });
     await get().loadCoats();
+    return { ok: result.ok, message: result.message };
   },
 
   nextSeq(bodyId) {
     const list = get().coats.filter((coat) => coat.bodyId === bodyId);
     return list.length === 0 ? 1 : Math.max(...list.map((coat) => coat.seq)) + 1;
+  },
+
+  async reconfirmRework(coatId, anchorId) {
+    const result = await confirmCoatRework(coatId, anchorId);
+    await get().loadCoats();
+    return { ok: result.ok, message: result.message };
+  },
+
+  async retryAnchorReturn(bodyId) {
+    const result = await retryReturnAnchors(bodyId, '工序台手动重新对账：旧定位退回待认领');
+    return { ok: result.ok, message: result.message };
   },
 
   suggestForBody(bodyId) {

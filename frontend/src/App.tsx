@@ -13,11 +13,13 @@ import {
   ExportOutlined,
   FormatPainterOutlined,
   HighlightOutlined,
+  SafetyCertificateOutlined,
 } from '@ant-design/icons';
 import { ROUTES } from './router';
 import { useBodyStore } from './stores/bodyStore';
 import { useCoatStore } from './stores/coatStore';
 import { useRoomStore } from './stores/roomStore';
+import { useQcStore } from './stores/qcStore';
 import { initDatabase } from './utils/db';
 import { BODY_MATERIAL_LABEL, BODY_SHAPE_LABEL, BODY_STATE_LABEL } from './types/body';
 
@@ -35,6 +37,8 @@ export default function App() {
   const loadCoats = useCoatStore((state) => state.loadCoats);
   const rooms = useRoomStore((state) => state.rooms);
   const loadRooms = useRoomStore((state) => state.loadRooms);
+  const loadQc = useQcStore((state) => state.loadQc);
+  const openAnchors = useQcStore((state) => state.anchors.filter((anchor) => !anchor.settled));
 
   useEffect(() => {
     let cancelled = false;
@@ -42,7 +46,7 @@ export default function App() {
       try {
         await initDatabase();
         if (cancelled) return;
-        await Promise.all([loadBodies(), loadCoats(), loadRooms()]);
+        await Promise.all([loadBodies(), loadCoats(), loadRooms(), loadQc()]);
       } catch (error) {
         if (cancelled) return;
         message.error(`本地数据库初始化失败：${error instanceof Error ? error.message : '未知错误'}`);
@@ -51,7 +55,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [loadBodies, loadCoats, loadRooms, message]);
+  }, [loadBodies, loadCoats, loadRooms, loadQc, message]);
 
   const currentBody = bodies.find((body) => body.id === currentBodyId) ?? null;
   const selectedKey = location.pathname.startsWith('/coats')
@@ -62,9 +66,11 @@ export default function App() {
         ? ROUTES.polish
         : location.pathname.startsWith('/inlays')
           ? ROUTES.inlays
-          : location.pathname.startsWith('/export')
-            ? ROUTES.export
-            : ROUTES.bodies;
+          : location.pathname.startsWith('/qc')
+            ? ROUTES.qc
+            : location.pathname.startsWith('/export')
+              ? ROUTES.export
+              : ROUTES.bodies;
 
   return (
     <Layout style={{ minHeight: '100vh', background: 'transparent' }}>
@@ -89,7 +95,8 @@ export default function App() {
             { key: ROUTES.rooms, icon: <CloudOutlined />, label: '荫房记录' },
             { key: ROUTES.polish, icon: <BgColorsOutlined />, label: '打磨推光' },
             { key: ROUTES.inlays, icon: <HighlightOutlined />, label: '镶嵌纹饰' },
-            { key: ROUTES.export, icon: <ExportOutlined />, label: '质检与导出' },
+            { key: ROUTES.qc, icon: <SafetyCertificateOutlined />, label: '质检室' },
+            { key: ROUTES.export, icon: <ExportOutlined />, label: '数据导入导出' },
           ]}
         />
         <div style={{ padding: '12px 16px', color: 'rgba(242,223,184,0.6)', fontSize: 12 }}>
@@ -99,6 +106,7 @@ export default function App() {
             </span>
             <span>髹涂道次 {coats.length} 道</span>
             <span>荫房记录 {rooms.length} 条</span>
+            <span>返工定位未平账 {openAnchors.length} 条</span>
           </Space>
         </div>
       </Sider>
@@ -129,9 +137,10 @@ export default function App() {
           </Space>
           <Space>
             <Button size="small" onClick={() => navigate(ROUTES.coats)}>
-              进入道次编排
+              进入工序台
             </Button>
             <Badge count={coats.filter((coat) => coat.needRecheck).length} color="#c9963c" title="待复检道次" />
+            <Badge count={openAnchors.length} color="#b03a2e" title="返工定位未平账" />
           </Space>
         </Header>
 
