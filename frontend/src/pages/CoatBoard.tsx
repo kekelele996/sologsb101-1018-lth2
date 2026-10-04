@@ -1,9 +1,11 @@
 /**
- * /coats 髹涂道次编排
- * 拖拽调整道次先后、批量改漆种与状态、同器型自动带出上次漆种与间隔建议。
+ * /coats 髹涂道次编排（髹涂工序台）
+ * 拖拽调整道次先后、批量改漆种与状态、同器型自动带出上次漆种与间隔建议；
+ * 质检返工生效的道次在此按现在的顺序逐道重新确认。
+ * 道次与漆种归工序台管理：质检室工位下本页只读，越权写入会被挡下。
  * 消费 Coat、Body；复用 <StageTag>、<FilterBar>、<StatBadge>、<EmptyPanel>。
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   App as AntdApp,
@@ -36,6 +38,8 @@ import StageTag from '@/components/common/StageTag';
 import { useCoatProgress } from '@/hooks/useCoatProgress';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
+import { useRoleStore } from '@/stores/roleStore';
+import { isRoleBlocked } from '@/utils/roleGuard';
 import {
   COAT_STATE_LABEL,
   COAT_STATE_OPTIONS,
@@ -71,12 +75,30 @@ export default function CoatBoard() {
   const removeCoat = useCoatStore((state) => state.removeCoat);
   const batchUpdate = useCoatStore((state) => state.batchUpdate);
   const advanceState = useCoatStore((state) => state.advanceState);
+  const confirmRework = useCoatStore((state) => state.confirmRework);
   const reorderCoats = useCoatStore((state) => state.reorderCoats);
   const nextSeq = useCoatStore((state) => state.nextSeq);
   const suggestForBody = useCoatStore((state) => state.suggestForBody);
+  const role = useRoleStore((state) => state.role);
 
   const { progressOf, currentCoatText, totals } = useCoatProgress();
   const url = useFilterQuery(FILTER_KEYS);
+
+  /** 当前工位是否可写道次：髹涂道次与漆种归工序台管理 */
+  const canEdit = role === 'bench';
+
+  /** 统一执行写入：越权被挡下时提示，其余异常报错 */
+  const run = useCallback(
+    async (action: () => Promise<void>): Promise<void> => {
+      try {
+        await action();
+      } catch (error) {
+        if (isRoleBlocked(error)) message.warning(error.message);
+        else message.error(error instanceof Error ? error.message : '操作失败');
+      }
+    },
+    [message],
+  );
 
   const [editing, setEditing] = useState<Coat | null>(null);
   const [open, setOpen] = useState(false);
@@ -115,8 +137,14 @@ export default function CoatBoard() {
 
   const suggestion = bodyId.length > 0 ? suggestForBody(bodyId) : null;
   const stat = bodyId.length > 0 ? progressOf(bodyId) : null;
+  /** 当前序号最小的待重确认道次：返工确认必须按现在的顺序逐道进行 */
+  const firstPending = bodyCoats.find((coat) => coat.pendingReconfirm);
 
   const openCreate = (): void => {
+    if (!canEdit) {
+      message.warning('越权操作已被挡下：髹涂道次与漆种归髹涂工序台管理，请切换工位后再操作');
+      return;
+    }
     if (!bodyId) {
       message.warning('请先选择或新建胎体');
       return;
@@ -146,18 +174,24 @@ export default function CoatBoard() {
 
   const submit = async (): Promise<void> => {
     const values = await form.validateFields();
-    const payload: CoatDraft = { ...values };
-    if (editing) {
-      await updateCoat(editing.id, payload);
-      message.success(`已更新第 ${payload.seq} 道工序`);
-    } else {
-      await createCoat(payload);
-      message.success(`已新增第 ${payload.seq} 道工序`);
-    }
-    setOpen(false);
+    await run(async () => {
+      const payload: CoatDraft = {
+        ...values,
+        pendingReconfirm: editing ? editing.pendingReconfirm : false,
+        syncHold: editing ? editing.syncHold : false,
+      };
+      if (editing) {
+        await updateCoat(editing.id, payload);
+        message.success(`已更新第 ${payload.seq} 道工序`);
+      } else {
+        await createCoat(payload);
+        message.success(`已新增第 ${payload.seq} 道工序`);
+      }
+      setOpen(false);
+    });
   };
 
-  /** 拖拽重排：按落点重排并落库重编号 */
+  /** 拖拽重排：按落点重排并落库重编号；调序后旧返工定位退回待认领 */
   const handleDrop = async (targetId: string): Promise<void> => {
     setOverId(null);
     if (!dragId || dragId === targetId || !bodyId) {
@@ -173,9 +207,15 @@ export default function CoatBoard() {
     }
     const [moved] = ids.splice(from, 1);
     ids.splice(to, 0, moved as string);
-    await reorderCoats(bodyId, ids);
+    await run(async () => {
+      const invalidated = await reorderCoats(bodyId, ids);
+      message.success(
+        invalidated > 0
+          ? `道次顺序已更新并重编号，${invalidated} 条返工定位已退回待认领`
+          : '道次顺序已更新并重编号',
+      );
+    });
     setDragId(null);
-    message.success('道次顺序已更新并重编号');
   };
 
   /** 状态推进校验：前一道未完成时禁止进入下一道 */
@@ -185,7 +225,19 @@ export default function CoatBoard() {
       message.warning(`第 ${previous.seq} 道尚未完成，禁止进入第 ${coat.seq} 道`);
       return;
     }
-    await advanceState(coat.id);
+    await run(async () => {
+      await advanceState(coat.id);
+    });
+  };
+
+  /** 删除道次：撤掉某一道后旧返工定位退回待认领 */
+  const handleRemove = async (coat: Coat): Promise<void> => {
+    await run(async () => {
+      const invalidated = await removeCoat(coat.id);
+      message.success(
+        invalidated > 0 ? `已删除该道次，${invalidated} 条返工定位已退回待认领` : '已删除该道次',
+      );
+    });
   };
 
   const columns: ColumnsType<Coat> = [
@@ -194,11 +246,14 @@ export default function CoatBoard() {
       dataIndex: 'drag',
       width: 44,
       render: (_value, record) => (
-        <Tooltip title="按住拖动可调整道次先后">
+        <Tooltip title={canEdit ? '按住拖动可调整道次先后' : '质检室工位下不可调序'}>
           <span
             className="gb-drag-handle"
-            draggable
-            onDragStart={() => setDragId(record.id)}
+            draggable={canEdit}
+            style={canEdit ? undefined : { cursor: 'not-allowed', opacity: 0.4 }}
+            onDragStart={() => {
+              if (canEdit) setDragId(record.id);
+            }}
             onDragEnd={() => {
               setDragId(null);
               setOverId(null);
@@ -215,7 +270,13 @@ export default function CoatBoard() {
       width: 90,
       sorter: (a, b) => a.seq - b.seq,
       render: (seq: number, record) => (
-        <StageTag state={record.state} seq={seq} needRecheck={record.needRecheck} />
+        <StageTag
+          state={record.state}
+          seq={seq}
+          needRecheck={record.needRecheck}
+          pendingReconfirm={record.pendingReconfirm}
+          syncHold={record.syncHold}
+        />
       ),
     },
     { title: '漆种', dataIndex: 'paintType', width: 100, render: (value: PaintType) => <Tag>{PAINT_TYPE_LABEL[value]}</Tag> },
@@ -230,23 +291,48 @@ export default function CoatBoard() {
     {
       title: '操作',
       key: 'action',
-      width: 220,
+      width: 280,
       render: (_value, record) => (
         <Space size={4} wrap>
-          <Button size="small" type="link" onClick={() => void handleAdvance(record)}>
+          {record.pendingReconfirm ? (
+            <Tooltip
+              title={
+                record.syncHold
+                  ? '对账挂起中，待质检室补齐返工定位'
+                  : firstPending?.id === record.id
+                    ? '确认本道返工已按现顺序重做完成'
+                    : `请按现在的顺序先确认第 ${firstPending?.seq ?? '-'} 道`
+              }
+            >
+              <Button
+                size="small"
+                type="link"
+                disabled={!canEdit || record.syncHold || firstPending?.id !== record.id}
+                onClick={() =>
+                  void run(async () => {
+                    await confirmRework(record.id);
+                    message.success(`第 ${record.seq} 道已重新确认`);
+                  })
+                }
+              >
+                确认返工
+              </Button>
+            </Tooltip>
+          ) : null}
+          <Button size="small" type="link" disabled={!canEdit} onClick={() => void handleAdvance(record)}>
             推进状态
           </Button>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
+          <Button size="small" type="link" icon={<EditOutlined />} disabled={!canEdit} onClick={() => openEdit(record)}>
             编辑
           </Button>
           <Popconfirm
             title="删除该道次"
-            description="删除后其余道次会自动重编号。"
+            description="删除后其余道次会自动重编号，该胎体的返工定位将退回待认领。"
             okText="确认"
             cancelText="取消"
-            onConfirm={() => void removeCoat(record.id).then(() => message.success('已删除该道次'))}
+            onConfirm={() => void handleRemove(record)}
           >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+            <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={!canEdit}>
               删除
             </Button>
           </Popconfirm>
@@ -273,16 +359,37 @@ export default function CoatBoard() {
             }))}
             onChange={(value: string) => setCurrentBodyId(value)}
           />
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
+          <Button type="primary" icon={<PlusOutlined />} disabled={!canEdit} onClick={openCreate}>
             新增道次
           </Button>
         </Space>
       </div>
 
+      {!canEdit ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message="当前工位：成品质检室。髹涂道次与漆种归髹涂工序台管理，本页只读；越权写入会被挡下，请切换工位后再编排。"
+        />
+      ) : null}
+
+      {firstPending ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`质检返工生效中：第 ${firstPending.seq} 道起 ${
+            bodyCoats.filter((coat) => coat.pendingReconfirm).length
+          } 道不算完成，需按现在的顺序逐道「确认返工」；确认完前该胎体不能再判合格。`}
+        />
+      ) : null}
+
       <div className="gb-stat-row">
         <StatBadge label="道次总数" value={stat?.coatTotal ?? 0} suffix="道" tone="primary" />
         <StatBadge label="完成率" value={`${stat?.coatPercent ?? 0}%`} percent={stat?.coatPercent ?? 0} tone="success" />
         <StatBadge label="当前道次" value={stat?.currentSeq ? `第 ${stat.currentSeq} 道` : '已完工'} tone="warning" />
+        <StatBadge label="待重确认" value={stat?.reworkPending ?? 0} suffix="道" tone="danger" />
         <StatBadge label="全局待复检" value={totals.recheck} suffix="道" tone="danger" />
         <StatBadge label="荫干等待" value={stat?.dryingHours ?? 0} suffix="小时" tone="info" />
       </div>
@@ -329,9 +436,10 @@ export default function CoatBoard() {
             />
             <Button
               size="small"
-              disabled={selectedIds.length === 0}
+              disabled={!canEdit || selectedIds.length === 0}
               onClick={() =>
-                void batchUpdate(selectedIds, { paintType: batchPaint }).then(() => {
+                void run(async () => {
+                  await batchUpdate(selectedIds, { paintType: batchPaint });
                   message.success(`已批量改为${PAINT_TYPE_LABEL[batchPaint]}`);
                   setSelectedIds([]);
                 })
@@ -348,9 +456,10 @@ export default function CoatBoard() {
             />
             <Button
               size="small"
-              disabled={selectedIds.length === 0}
+              disabled={!canEdit || selectedIds.length === 0}
               onClick={() =>
-                void batchUpdate(selectedIds, { state: batchState }).then(() => {
+                void run(async () => {
+                  await batchUpdate(selectedIds, { state: batchState });
                   message.success(`已批量改为${COAT_STATE_LABEL[batchState]}`);
                   setSelectedIds([]);
                 })

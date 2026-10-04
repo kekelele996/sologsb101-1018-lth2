@@ -15,6 +15,10 @@ export interface StageTagProps {
   state: StageKey;
   /** 是否需要复检（荫房温湿度越界后回写） */
   needRecheck?: boolean;
+  /** 返工失效，待工序台按现在的顺序重新确认 */
+  pendingReconfirm?: boolean;
+  /** 两侧对账挂起，等质检室补齐返工定位 */
+  syncHold?: boolean;
   /** 道次序号，传入时前缀显示「第 n 道」 */
   seq?: number;
   /** 追加文案，如「已完成 2/4」 */
@@ -24,14 +28,15 @@ export interface StageTagProps {
 const LABEL: Record<string, string> = { ...BODY_STATE_LABEL, ...COAT_STATE_LABEL };
 const COLOR: Record<string, string> = { ...BODY_STATE_COLOR, ...COAT_STATE_COLOR };
 
-export function StageTag({ state, needRecheck = false, seq, suffix }: StageTagProps) {
+export function StageTag({ state, needRecheck = false, pendingReconfirm = false, syncHold = false, seq, suffix }: StageTagProps) {
   const label = LABEL[state] ?? state;
   const color = COLOR[state] ?? '#8c8c8c';
   const text = `${seq === undefined ? '' : `第 ${seq} 道 · `}${label}${suffix ? ` · ${suffix}` : ''}`;
+  const hasExtra = needRecheck || pendingReconfirm || syncHold;
 
   return (
     <>
-      <Tag color={color} style={{ marginInlineEnd: needRecheck ? 4 : 0 }}>
+      <Tag color={color} style={{ marginInlineEnd: hasExtra ? 4 : 0 }}>
         {text}
       </Tag>
       {needRecheck ? (
@@ -39,6 +44,16 @@ export function StageTag({ state, needRecheck = false, seq, suffix }: StageTagPr
           <Tag icon={<ExclamationCircleOutlined />} color="warning">
             待复检
           </Tag>
+        </Tooltip>
+      ) : null}
+      {pendingReconfirm ? (
+        <Tooltip title="质检返工生效中：本道不算完成，待工序台按现在的顺序重新确认">
+          <Tag color="volcano">待重确认</Tag>
+        </Tooltip>
+      ) : null}
+      {syncHold ? (
+        <Tooltip title="两侧对账不符，已挂起等质检室补齐返工定位">
+          <Tag color="purple">对账挂起</Tag>
         </Tooltip>
       ) : null}
     </>

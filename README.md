@@ -68,11 +68,11 @@ npm run preview    # 本地预览构建产物（http://localhost:22818）
 | 路由 | 页面 | 主要职责 | 消费模型 |
 | --- | --- | --- | --- |
 | `/bodies` | 胎体与器型台账 | 新建胎体、按材质与器型筛选（同步 URL query），卡片回显已完成道次与最近荫房记录 | Body、Coat、Room |
-| `/coats` | 髹涂道次编排 | 拖拽调整道次先后并重编号、批量改漆种与状态、同器型自动带出上次漆种与间隔建议 | Coat、Body |
+| `/coats` | 髹涂道次编排（工序台） | 拖拽调整道次先后并重编号、批量改漆种与状态、同器型自动带出上次漆种与间隔建议、返工道次按现顺序逐道重确认 | Coat、Body |
 | `/rooms` | 荫房温湿度记录 | 按区间判定适宜 / 偏干 / 偏湿，越界回写关联道次为「待复检」，支持日期区间筛选 | Room、Coat |
 | `/polish` | 打磨与推光工序 | 按道次生成目数序列（320→2000），未打磨完的道次禁止进入下一道罩漆 | Polish、Coat |
 | `/inlays` | 镶嵌纹饰登记 | 螺钿 / 蛋壳 / 描金 / 戗金登记与批量调整分类，器型示意区叠加显示 | Inlay、Body |
-| `/export` | 成品质检与导出 | 质检登记（返工定位到具体道次与荫房记录）、返工清单、JSON 导入导出与清空重播种 | Inspect 及全部模型 |
+| `/export` | 成品质检与导出（质检室） | 质检登记（返工定位生成固定标识）、返工清单、两侧对账、升级报告、JSON 导入导出与清空重播种 | Inspect 及全部模型 |
 
 `/` 与未匹配路径重定向到 `/bodies`。筛选条件写入 URL query（`?kw=&paintType=&state=` 等），刷新后条件保留，可直接分享链接。
 
@@ -83,13 +83,24 @@ npm run preview    # 本地预览构建产物（http://localhost:22818）
 | 模型 | 文件 | 关键字段 | 说明 |
 | --- | --- | --- | --- |
 | Body 胎体 | `src/types/body.ts` | `id` `code` `material`（木/脱胎/金属） `shape`（碗/盘/盒/瓶） `sizeMm` `ownerName` `state`（待髹涂/髹涂中/待荫干/已完成） | 新建后进入道次编排，卡片回显进度与最近荫房 |
-| Coat 髹涂道次 | `src/types/coat.ts` | `id` `bodyId` `seq` `paintType`（生漆/色漆/罩漆） `colorName` `coatDate` `thicknessUm` `state`（待涂/已涂/待打磨/已完成） `needRecheck` | 拖拽调序，同器型带出上次漆种与间隔建议 |
+| Coat 髹涂道次 | `src/types/coat.ts` | `id` `bodyId` `seq` `paintType`（生漆/色漆/罩漆） `colorName` `coatDate` `thicknessUm` `state`（待涂/已涂/待打磨/已完成） `needRecheck` `pendingReconfirm` `syncHold` | 拖拽调序，同器型带出上次漆种与间隔建议；返工失效道次待重确认 |
 | Room 荫房记录 | `src/types/room.ts` | `id` `bodyId` `date` `tempC` `humidityPct` `inAt` `outAt` `verdict`（适宜/偏干/偏湿） | 越界即回写关联道次为待复检 |
 | Polish 打磨推光 | `src/types/polish.ts` | `id` `bodyId` `seq` `grit` `method`（水砂/推光/揩清） `durationMin` `operator` | 按道次生成目数序列 |
 | Inlay 镶嵌 | `src/types/inlay.ts` | `id` `bodyId` `type`（螺钿/蛋壳/描金/戗金） `pattern` `position` `materialNote` | 器型示意区叠加显示，支持批量改分类 |
-| Inspect 质检 | `src/types/inspect.ts` | `id` `bodyId` `verdict`（合格/返工） `defectNote` `inspector` `date` `defectCoatSeq` `defectRoomId` | 返工定位到道次与荫房记录并生成返工清单 |
+| Inspect 质检 | `src/types/inspect.ts` | `id` `bodyId` `verdict`（合格/返工） `defectNote` `inspector` `date` `defectCoatSeq` `defectRoomId` `reworkKey` `locateState`（已定位/待认领/已挂起） | 返工定位生成固定标识（胎体编号#道次序号）并生成返工清单 |
 
-数据结构版本号 `DB_SCHEMA_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`coats` 表增加 `paintType` 索引，并在 Dexie `.upgrade()` 中为历史记录回填 `paintType = 'raw'`、`needRecheck = false`、`thicknessUm = 40`。
+数据结构版本号 `DB_SCHEMA_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`：`coats` 表增加 `pendingReconfirm` / `syncHold` 标记，`inspects` 表增加 `reworkKey` / `locateState`；Dexie `.upgrade()` 按当时的道次顺序为历史返工定位补固定标识，补不出的单列进升级报告（`/export` 页「结构升级报告」卡片展示）。旧版 JSON 备份导入时走同一套补齐逻辑。
+
+---
+
+## 五之一、质检室与工序台两摊分记
+
+成品质检与髹涂工序分开记账，靠顶栏「当前工位」切换身份：
+
+- **髹涂工序台**：管 `coats` 表（髹涂道次与漆种）；**成品质检室**：管 `inspects` 表（质检结论与返工定位）。越权改对方那份会被挡下——所有用户写入口（`useIdbTable` 写方法与 `coatStore` 写动作）统一经 `utils/roleGuard.ts` 校验当前工位，非本工位写入抛 `RoleBlockedError` 并由页面提示；荫房回写、返工失效等系统内部联动走系统通道，不受工位限制。
+- **返工失效**：质检判返工并定位到第 N 道后，该道及其后道次置 `pendingReconfirm`（不再计入完成数），由工序台在 `/coats` 按现在的顺序逐道「确认返工」；确认完前该胎体不能再判合格（质检室提交合格时拦截）。
+- **调序 / 撤道**：工序台调序、改道次序号或删除道次后，该胎体已生效的返工定位自动退回「待认领」（旧标识保留备查），需质检室重新认领定位。
+- **两侧对账**：`/export` 页「开始对账」按 胎体编号#道次序号 核对两边账目——质检侧定位在工序侧没有对应道次的挂起（等工序台补道），工序侧失效道次没有生效定位覆盖的挂起（等质检室补定位）；两侧各占独立事务，哪侧失败只回滚哪侧，对方已补的账目在下次对账时自动恢复。
 
 ---
 
@@ -100,12 +111,12 @@ sologsb101-1018/
 ├── frontend/                     # 前端源码
 │   ├── src/
 │   │   ├── types/                # body.ts coat.ts room.ts polish.ts inlay.ts inspect.ts
-│   │   ├── stores/               # bodyStore.ts coatStore.ts roomStore.ts
+│   │   ├── stores/               # bodyStore.ts coatStore.ts roomStore.ts roleStore.ts
 │   │   ├── components/common/    # StageTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
 │   │   ├── hooks/                # useCoatProgress.ts useIdbTable.ts
 │   │   ├── pages/                # BodyList.tsx CoatBoard.tsx RoomLog.tsx PolishBoard.tsx InlayBoard.tsx ExportView.tsx
 │   │   ├── router/               # index.tsx
-│   │   ├── utils/                # humidity.ts db.ts export.ts
+│   │   ├── utils/                # humidity.ts db.ts export.ts roleGuard.ts rework.ts reworkSync.ts
 │   │   ├── styles/               # main.css
 │   │   ├── App.tsx main.tsx
 │   ├── public/favicon.svg
@@ -126,7 +137,7 @@ sologsb101-1018/
 ## 七、数据存储说明
 
 - **IndexedDB（Dexie，数据库名 `gblacquer`）**：6 张业务表 `bodies` / `coats` / `rooms` / `polishes` / `inlays` / `inspects`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 在首次打开时自动播种**三层互相引用**的演示数据（Body → Coat / Room → Polish / Inlay / Inspect，固定 id 如 `body_01`、`coat_0101`），播种幂等。
-- **localStorage**：仅存元数据 —— `gblacquer:db-version`（本地结构版本）、`gblacquer:last-backup-at`（最近导出时间）、`gblacquer:ui-prefs`（当前选中胎体）。
+- **localStorage**：仅存元数据 —— `gblacquer:db-version`（本地结构版本）、`gblacquer:last-backup-at`（最近导出时间）、`gblacquer:ui-prefs`（当前选中胎体）、`gblacquer:work-role`（当前工位）、`gblacquer:last-migration`（最近一次结构升级报告）。
 - **备份**：`/export` 页可导出 JSON（6 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性，覆盖导入前二次确认；另有返工清单 TXT 与工序台账 CSV。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 

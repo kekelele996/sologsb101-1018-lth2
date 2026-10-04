@@ -1,6 +1,7 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据结构版本号与升级迁移逻辑（v1 → v2：Coat 增加 paintType 索引并回填历史记录）
+ * - 数据结构版本号与升级迁移逻辑（v1 → v2：Coat 增加 paintType 索引并回填历史记录；
+ *   v2 → v3：两摊分记，Coat 补返工失效/对账挂起标记，Inspect 按当时道次顺序补返工定位固定标识）
  * - 六张业务表的增删改查与整库导入导出
  * - 首次打开自动播种互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
@@ -12,18 +13,20 @@ import type { Room } from '@/types/room';
 import type { Polish } from '@/types/polish';
 import type { Inlay } from '@/types/inlay';
 import type { Inspect } from '@/types/inspect';
+import { normalizeRows, type ReworkBackfillFailure } from './rework';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gblacquer';
 
 /** 当前数据结构版本号 */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
   dbVersion: 'gblacquer:db-version',
   lastBackupAt: 'gblacquer:last-backup-at',
   uiPrefs: 'gblacquer:ui-prefs',
+  lastMigration: 'gblacquer:last-migration',
 } as const;
 
 export interface UiPrefs {
@@ -77,6 +80,36 @@ export function writeLastBackupAt(value: string): void {
   }
 }
 
+/** 结构升级报告：旧数据为返工定位补固定标识的结果，补不出的单列 */
+export interface MigrationReport {
+  from: number;
+  to: number;
+  at: string;
+  source: 'upgrade' | 'import';
+  backfilled: number;
+  failed: ReworkBackfillFailure[];
+}
+
+/** Dexie 升级事务提交后由 initDatabase 落 localStorage（事务回滚则报告作废） */
+let pendingMigrationReport: MigrationReport | null = null;
+
+export function readLastMigration(): MigrationReport | null {
+  try {
+    const raw = localStorage.getItem(LS_KEYS.lastMigration);
+    return raw ? (JSON.parse(raw) as MigrationReport) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeLastMigration(report: MigrationReport): void {
+  try {
+    localStorage.setItem(LS_KEYS.lastMigration, JSON.stringify(report));
+  } catch {
+    /* ignore */
+  }
+}
+
 class LacquerDatabase extends Dexie {
   bodies!: Table<Body, string>;
   coats!: Table<Coat, string>;
@@ -99,7 +132,7 @@ class LacquerDatabase extends Dexie {
     });
 
     // v2：Coat 增加 paintType 索引；历史记录缺少 paintType 时按「生漆」回填
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         bodies: 'id, code, material, shape, state, updatedAt',
         coats: 'id, bodyId, seq, paintType, state, needRecheck, updatedAt',
@@ -119,6 +152,34 @@ class LacquerDatabase extends Dexie {
             if (typeof coat.thicknessUm !== 'number') coat.thicknessUm = 40;
           });
       });
+
+    // v3：两摊分记——Coat 补返工失效/对账挂起标记，Inspect 补返工定位固定标识与定位状态；
+    // 升级时按当时的道次顺序为返工定位补固定标识，补不出的单列进升级报告
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        bodies: 'id, code, material, shape, state, updatedAt',
+        coats: 'id, bodyId, seq, paintType, state, needRecheck, pendingReconfirm, updatedAt',
+        rooms: 'id, bodyId, date, verdict, updatedAt',
+        polishes: 'id, bodyId, seq, method, updatedAt',
+        inlays: 'id, bodyId, type, position, updatedAt',
+        inspects: 'id, bodyId, verdict, date, locateState, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const bodies = await tx.table<Body>('bodies').toArray();
+        const coats = await tx.table<Coat>('coats').toArray();
+        const inspects = await tx.table<Inspect>('inspects').toArray();
+        const normalized = normalizeRows({ bodies, coats, inspects });
+        await tx.table<Coat>('coats').bulkPut(normalized.coats);
+        await tx.table<Inspect>('inspects').bulkPut(normalized.inspects);
+        pendingMigrationReport = {
+          from: 2,
+          to: DB_SCHEMA_VERSION,
+          at: new Date().toISOString(),
+          source: 'upgrade',
+          backfilled: normalized.backfill.backfilled,
+          failed: normalized.backfill.failed,
+        };
+      });
   }
 }
 
@@ -137,6 +198,10 @@ export function createId(prefix: string): string {
 export async function initDatabase(): Promise<void> {
   await db.open();
   stampDbVersion();
+  if (pendingMigrationReport) {
+    writeLastMigration(pendingMigrationReport);
+    pendingMigrationReport = null;
+  }
   if ((await db.bodies.count()) === 0) {
     await seedDatabase();
   }
@@ -184,14 +249,14 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   const coats: Coat[] = [
-    { id: 'coat_0101', bodyId: 'body_01', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-03-02', thicknessUm: 40, state: 'done', needRecheck: false, createdAt: now - 86400000 * 11, updatedAt: now - 86400000 * 10 },
-    { id: 'coat_0102', bodyId: 'body_01', seq: 2, paintType: 'color', colorName: '朱红', coatDate: '2026-03-06', thicknessUm: 45, state: 'toPolish', needRecheck: true, createdAt: now - 86400000 * 7, updatedAt: now - 86400000 * 2 },
-    { id: 'coat_0103', bodyId: 'body_01', seq: 3, paintType: 'topcoat', colorName: '推光本色', coatDate: '2026-03-12', thicknessUm: 30, state: 'todo', needRecheck: false, createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 6 },
-    { id: 'coat_0201', bodyId: 'body_02', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-03-03', thicknessUm: 35, state: 'done', needRecheck: false, createdAt: now - 86400000 * 8, updatedAt: now - 86400000 * 7 },
-    { id: 'coat_0202', bodyId: 'body_02', seq: 2, paintType: 'color', colorName: '赭石', coatDate: '2026-03-08', thicknessUm: 42, state: 'coated', needRecheck: true, createdAt: now - 86400000 * 5, updatedAt: now - 86400000 },
-    { id: 'coat_0301', bodyId: 'body_03', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-02-10', thicknessUm: 38, state: 'done', needRecheck: false, createdAt: now - 86400000 * 26, updatedAt: now - 86400000 * 25 },
-    { id: 'coat_0302', bodyId: 'body_03', seq: 2, paintType: 'color', colorName: '石绿', coatDate: '2026-02-18', thicknessUm: 44, state: 'done', needRecheck: false, createdAt: now - 86400000 * 20, updatedAt: now - 86400000 * 18 },
-    { id: 'coat_0303', bodyId: 'body_03', seq: 3, paintType: 'topcoat', colorName: '描金', coatDate: '2026-02-26', thicknessUm: 28, state: 'done', needRecheck: false, createdAt: now - 86400000 * 14, updatedAt: now - 86400000 * 4 },
+    { id: 'coat_0101', bodyId: 'body_01', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-03-02', thicknessUm: 40, state: 'done', needRecheck: false, pendingReconfirm: false, syncHold: false, createdAt: now - 86400000 * 11, updatedAt: now - 86400000 * 10 },
+    { id: 'coat_0102', bodyId: 'body_01', seq: 2, paintType: 'color', colorName: '朱红', coatDate: '2026-03-06', thicknessUm: 45, state: 'toPolish', needRecheck: true, pendingReconfirm: false, syncHold: false, createdAt: now - 86400000 * 7, updatedAt: now - 86400000 * 2 },
+    { id: 'coat_0103', bodyId: 'body_01', seq: 3, paintType: 'topcoat', colorName: '推光本色', coatDate: '2026-03-12', thicknessUm: 30, state: 'todo', needRecheck: false, pendingReconfirm: false, syncHold: false, createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 6 },
+    { id: 'coat_0201', bodyId: 'body_02', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-03-03', thicknessUm: 35, state: 'done', needRecheck: false, pendingReconfirm: false, syncHold: false, createdAt: now - 86400000 * 8, updatedAt: now - 86400000 * 7 },
+    { id: 'coat_0202', bodyId: 'body_02', seq: 2, paintType: 'color', colorName: '赭石', coatDate: '2026-03-08', thicknessUm: 42, state: 'coated', needRecheck: true, pendingReconfirm: true, syncHold: false, createdAt: now - 86400000 * 5, updatedAt: now - 86400000 },
+    { id: 'coat_0301', bodyId: 'body_03', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-02-10', thicknessUm: 38, state: 'done', needRecheck: false, pendingReconfirm: false, syncHold: false, createdAt: now - 86400000 * 26, updatedAt: now - 86400000 * 25 },
+    { id: 'coat_0302', bodyId: 'body_03', seq: 2, paintType: 'color', colorName: '石绿', coatDate: '2026-02-18', thicknessUm: 44, state: 'done', needRecheck: false, pendingReconfirm: false, syncHold: false, createdAt: now - 86400000 * 20, updatedAt: now - 86400000 * 18 },
+    { id: 'coat_0303', bodyId: 'body_03', seq: 3, paintType: 'topcoat', colorName: '描金', coatDate: '2026-02-26', thicknessUm: 28, state: 'done', needRecheck: false, pendingReconfirm: false, syncHold: false, createdAt: now - 86400000 * 14, updatedAt: now - 86400000 * 4 },
   ];
 
   const rooms: Room[] = [
@@ -216,8 +281,8 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   const inspects: Inspect[] = [
-    { id: 'inspect_0101', bodyId: 'body_03', verdict: 'pass', defectNote: '', inspector: '周衡', date: '2026-03-02', defectCoatSeq: null, defectRoomId: null, createdAt: now - 86400000 * 4, updatedAt: now - 86400000 * 4 },
-    { id: 'inspect_0102', bodyId: 'body_02', verdict: 'rework', defectNote: '起皱（荫干过快）', inspector: '周衡', date: '2026-03-08', defectCoatSeq: 2, defectRoomId: 'room_0201', createdAt: now - 86400000, updatedAt: now - 86400000 },
+    { id: 'inspect_0101', bodyId: 'body_03', verdict: 'pass', defectNote: '', inspector: '周衡', date: '2026-03-02', defectCoatSeq: null, defectRoomId: null, reworkKey: null, locateState: null, createdAt: now - 86400000 * 4, updatedAt: now - 86400000 * 4 },
+    { id: 'inspect_0102', bodyId: 'body_02', verdict: 'rework', defectNote: '起皱（荫干过快）', inspector: '周衡', date: '2026-03-08', defectCoatSeq: 2, defectRoomId: 'room_0201', reworkKey: 'LQ-2402#2', locateState: 'located', createdAt: now - 86400000, updatedAt: now - 86400000 },
   ];
 
   await db.transaction('rw', TABLE_LIST, async () => {
@@ -279,15 +344,31 @@ export function validateSnapshot(input: unknown): string {
 }
 
 export async function importSnapshot(snapshot: LacquerSnapshot): Promise<void> {
+  // 旧版本备份缺少返工定位固定标识等字段，导入时按备份内的道次顺序补齐，补不出的写进升级报告
+  const normalized = normalizeRows({
+    bodies: snapshot.bodies,
+    coats: snapshot.coats,
+    inspects: snapshot.inspects,
+  });
   await clearAllTables();
   await db.transaction('rw', TABLE_LIST, async () => {
     await db.bodies.bulkPut(snapshot.bodies);
-    await db.coats.bulkPut(snapshot.coats);
+    await db.coats.bulkPut(normalized.coats);
     await db.rooms.bulkPut(snapshot.rooms);
     await db.polishes.bulkPut(snapshot.polishes);
     await db.inlays.bulkPut(snapshot.inlays);
-    await db.inspects.bulkPut(snapshot.inspects);
+    await db.inspects.bulkPut(normalized.inspects);
   });
+  if (normalized.backfill.backfilled > 0 || normalized.backfill.failed.length > 0) {
+    writeLastMigration({
+      from: typeof snapshot.schemaVersion === 'number' ? snapshot.schemaVersion : 0,
+      to: DB_SCHEMA_VERSION,
+      at: new Date().toISOString(),
+      source: 'import',
+      backfilled: normalized.backfill.backfilled,
+      failed: normalized.backfill.failed,
+    });
+  }
 }
 
 export async function clearAllTables(): Promise<void> {

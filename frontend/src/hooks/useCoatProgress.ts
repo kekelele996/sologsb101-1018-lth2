@@ -17,6 +17,7 @@ const EMPTY_STAT: BodyStat = {
   coatDone: 0,
   coatPercent: 0,
   currentSeq: 0,
+  reworkPending: 0,
   roomCount: 0,
   roomOverCount: 0,
   lastRoomVerdict: '暂无记录',
@@ -30,8 +31,8 @@ export interface CoatProgressResult {
   map: Record<string, BodyStat>;
   /** 与胎体列表同序的统计数组 */
   list: BodyStat[];
-  /** 汇总：道次总数 / 已完成 / 待复检 */
-  totals: { coatTotal: number; coatDone: number; percent: number; recheck: number; roomOver: number };
+  /** 汇总：道次总数 / 已完成 / 待复检 / 待重确认 */
+  totals: { coatTotal: number; coatDone: number; percent: number; recheck: number; rework: number; roomOver: number };
   /** 取单个胎体的统计（不存在时返回空统计） */
   progressOf: (bodyId: string) => BodyStat;
   /** 取单个胎体的当前道次文案 */
@@ -52,8 +53,10 @@ export function useCoatProgress(): CoatProgressResult {
       const bodyRooms = rooms
         .filter((room) => room.bodyId === body.id)
         .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
-      const done = bodyCoats.filter((coat) => coat.state === 'done').length;
-      const current = bodyCoats.find((coat) => coat.state !== 'done');
+      // 返工待重确认与对账挂起的道次不算完成，且重新成为「当前道次」
+      const done = bodyCoats.filter((coat) => coat.state === 'done' && !coat.pendingReconfirm && !coat.syncHold).length;
+      const current = bodyCoats.find((coat) => coat.state !== 'done' || coat.pendingReconfirm || coat.syncHold);
+      const reworkPending = bodyCoats.filter((coat) => coat.pendingReconfirm).length;
       const lastRoom = bodyRooms[bodyRooms.length - 1];
       const overCount = bodyRooms.filter((room) => room.verdict !== 'suitable').length;
       const waitHours = lastRoom
@@ -67,6 +70,7 @@ export function useCoatProgress(): CoatProgressResult {
         coatDone: done,
         coatPercent: bodyCoats.length === 0 ? 0 : Math.round((done / bodyCoats.length) * 100),
         currentSeq: current ? current.seq : 0,
+        reworkPending,
         roomCount: bodyRooms.length,
         roomOverCount: overCount,
         lastRoomVerdict: lastRoom
@@ -90,6 +94,7 @@ export function useCoatProgress(): CoatProgressResult {
       coatDone,
       percent: coatTotal === 0 ? 0 : Math.round((coatDone / coatTotal) * 100),
       recheck: coats.filter((coat) => coat.needRecheck).length,
+      rework: coats.filter((coat) => coat.pendingReconfirm).length,
       roomOver: list.reduce((sum, item) => sum + item.roomOverCount, 0),
     };
   }, [coats, list]);
@@ -105,7 +110,10 @@ export function useCoatProgress(): CoatProgressResult {
       if (!stat || stat.coatTotal === 0) return '尚未编排道次';
       const current = coats.find((coat) => coat.bodyId === bodyId && coat.seq === stat.currentSeq);
       if (!current) return `全部 ${stat.coatTotal} 道已完成`;
-      return `第 ${current.seq} 道 · ${COAT_STATE_LABEL[current.state]}`;
+      const flags = [COAT_STATE_LABEL[current.state]];
+      if (current.pendingReconfirm) flags.push('待重确认');
+      if (current.syncHold) flags.push('对账挂起');
+      return `第 ${current.seq} 道 · ${flags.join(' · ')}`;
     },
     [coats, map],
   );

@@ -102,12 +102,14 @@ export interface BodyStat {
   bodyId: string;
   /** 已编排道次总数 */
   coatTotal: number;
-  /** 已完成道次 */
+  /** 已完成道次（返工待重确认与对账挂起的不计入） */
   coatDone: number;
   /** 道次完成率 0-100 */
   coatPercent: number;
   /** 当前道次序号（无则 0） */
   currentSeq: number;
+  /** 返工失效待工序台重新确认的道次数 */
+  reworkPending: number;
   /** 荫房记录条数 */
   roomCount: number;
   /** 荫房超标次数 */

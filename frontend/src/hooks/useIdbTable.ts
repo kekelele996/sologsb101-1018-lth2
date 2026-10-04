@@ -1,11 +1,13 @@
 /**
  * useIdbTable：Dexie 单表增删改查 + liveQuery 响应式订阅封装
  * 被全部页面消费；页面不直接触碰 Dexie 实例。
+ * 写方法统一经 assertTableWrite 校验当前工位：coats 归工序台、inspects 归质检室，越权即挡下。
  */
 import { liveQuery } from 'dexie';
 import type { Table } from 'dexie';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createId, db } from '@/utils/db';
+import { assertTableWrite } from '@/utils/roleGuard';
 
 export interface IdbRecord {
   id: string;
@@ -93,6 +95,7 @@ export function useIdbTable<T extends IdbRecord>(
 
   const create = useCallback<UseIdbTableResult<T>['create']>(
     async (payload, idPrefix = 'row') => {
+      assertTableWrite(table.name);
       const now = Date.now();
       const record = {
         ...(payload as object),
@@ -108,6 +111,7 @@ export function useIdbTable<T extends IdbRecord>(
 
   const update = useCallback<UseIdbTableResult<T>['update']>(
     async (id, patch) => {
+      assertTableWrite(table.name);
       await table.update(id, { ...patch, updatedAt: Date.now() } as never);
     },
     [table],
@@ -115,6 +119,7 @@ export function useIdbTable<T extends IdbRecord>(
 
   const upsert = useCallback<UseIdbTableResult<T>['upsert']>(
     async (row) => {
+      assertTableWrite(table.name);
       await table.put({ ...row, updatedAt: Date.now() } as T);
     },
     [table],
@@ -122,6 +127,7 @@ export function useIdbTable<T extends IdbRecord>(
 
   const remove = useCallback<UseIdbTableResult<T>['remove']>(
     async (id) => {
+      assertTableWrite(table.name);
       await table.delete(id);
     },
     [table],
@@ -129,6 +135,7 @@ export function useIdbTable<T extends IdbRecord>(
 
   const bulkRemove = useCallback<UseIdbTableResult<T>['bulkRemove']>(
     async (ids) => {
+      assertTableWrite(table.name);
       await table.bulkDelete(ids);
     },
     [table],
@@ -136,12 +143,14 @@ export function useIdbTable<T extends IdbRecord>(
 
   const bulkPut = useCallback<UseIdbTableResult<T>['bulkPut']>(
     async (list) => {
+      assertTableWrite(table.name);
       await table.bulkPut(list);
     },
     [table],
   );
 
   const clear = useCallback(async (): Promise<void> => {
+    assertTableWrite(table.name);
     await table.clear();
   }, [table]);
 

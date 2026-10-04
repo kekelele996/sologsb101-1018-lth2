@@ -6,6 +6,9 @@
 /** 质检结论：合格 / 返工 */
 export type InspectVerdict = 'pass' | 'rework';
 
+/** 返工定位状态：已定位 / 待认领（工序台调序或撤道后退回）/ 已挂起（对账不符等对方补） */
+export type LocateState = 'located' | 'unclaimed' | 'suspended';
+
 export interface Inspect {
   id: string;
   /** 所属胎体 id */
@@ -22,6 +25,10 @@ export interface Inspect {
   defectCoatSeq: number | null;
   /** 返工时定位到的荫房记录 id，无则 null */
   defectRoomId: string | null;
+  /** 返工定位固定标识：胎体编号#道次序号（如 LQ-2402#2），两侧对账即按此键 */
+  reworkKey: string | null;
+  /** 返工定位状态；非返工或未定位为 null */
+  locateState: LocateState | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -43,6 +50,18 @@ export const INSPECT_VERDICT_OPTIONS: ReadonlyArray<{ value: InspectVerdict; lab
   { value: 'rework', label: '返工' },
 ];
 
+export const LOCATE_STATE_LABEL: Record<LocateState, string> = {
+  located: '已定位',
+  unclaimed: '待认领',
+  suspended: '已挂起',
+};
+
+export const LOCATE_STATE_COLOR: Record<LocateState, string> = {
+  located: '#2f6f4f',
+  unclaimed: '#c9963c',
+  suspended: '#b03a2e',
+};
+
 export const DEFECT_NOTE_OPTIONS: readonly string[] = [
   '漆面流挂',
   '起皱（荫干过快）',
@@ -61,5 +80,7 @@ export function createEmptyInspectDraft(bodyId: string): InspectDraft {
     date: new Date().toISOString().slice(0, 10),
     defectCoatSeq: null,
     defectRoomId: null,
+    reworkKey: null,
+    locateState: null,
   };
 }

@@ -1,9 +1,11 @@
 /**
- * /export 成品质检与 JSON 结构版本导入导出
- * 判定返工时定位到具体道次与荫房记录并生成返工清单；支持整库 JSON 导入导出与清空重播种。
+ * /export 成品质检与 JSON 结构版本导入导出（成品质检室）
+ * 质检室管质检结论与返工定位：判定返工时定位到具体道次并生成固定标识（胎体编号#道次序号），
+ * 定位生效后该道及其后道次不算完成，未确认完前该胎体不能再判合格；
+ * 两侧按固定标识对账，对不上先挂起等对方补，哪侧失败只退哪侧。
  * 消费 Inspect 及全部模型；复用 <StatBadge>、<EmptyPanel>。
  */
-import { useMemo, useRef, useState, type ChangeEvent } from 'react';
+import { useCallback, useMemo, useRef, useState, type ChangeEvent } from 'react';
 import {
   Alert,
   App as AntdApp,
@@ -30,12 +32,14 @@ import {
   FileTextOutlined,
   PlusOutlined,
   ReloadOutlined,
+  SwapOutlined,
 } from '@ant-design/icons';
 import EmptyPanel from '@/components/common/EmptyPanel';
 import StatBadge from '@/components/common/StatBadge';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
+import { useRoleStore } from '@/stores/roleStore';
 import { useRoomStore } from '@/stores/roomStore';
 import { COAT_STATE_LABEL, PAINT_TYPE_LABEL } from '@/types/coat';
 import { BODY_SHAPE_LABEL } from '@/types/body';
@@ -44,6 +48,8 @@ import {
   INSPECT_VERDICT_COLOR,
   INSPECT_VERDICT_LABEL,
   INSPECT_VERDICT_OPTIONS,
+  LOCATE_STATE_COLOR,
+  LOCATE_STATE_LABEL,
   createEmptyInspectDraft,
   type Inspect,
   type InspectDraft,
@@ -55,11 +61,16 @@ import {
   exportSnapshot,
   importSnapshot,
   readLastBackupAt,
+  readLastMigration,
   resetDatabase,
   validateSnapshot,
   writeLastBackupAt,
   type LacquerSnapshot,
+  type MigrationReport,
 } from '@/utils/db';
+import { isRoleBlocked } from '@/utils/roleGuard';
+import { buildReworkKey, passBlockReason, type ReconcileReport } from '@/utils/rework';
+import { reconcileBothSides, recomputeReworkInvalidation } from '@/utils/reworkSync';
 import { buildReworkList, copyText, exportLedgerCsv, exportReworkList, exportSnapshotJson } from '@/utils/export';
 
 export default function ExportView() {
@@ -74,12 +85,32 @@ export default function ExportView() {
   const loadCoats = useCoatStore((state) => state.loadCoats);
   const rooms = useRoomStore((state) => state.rooms);
   const loadRooms = useRoomStore((state) => state.loadRooms);
+  const role = useRoleStore((state) => state.role);
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Inspect | null>(null);
   const [lastBackupAt, setLastBackupAt] = useState<string | null>(readLastBackupAt());
+  const [migration, setMigration] = useState<MigrationReport | null>(() => readLastMigration());
+  const [report, setReport] = useState<ReconcileReport | null>(null);
+  const [reconciling, setReconciling] = useState(false);
   const watchedBodyId = Form.useWatch('bodyId', form) as string | undefined;
   const watchedVerdict = Form.useWatch('verdict', form) as InspectVerdict | undefined;
+
+  /** 当前工位是否可写质检：质检结论与返工定位归质检室管理 */
+  const canQc = role === 'qc';
+
+  /** 统一执行写入：越权被挡下时提示，其余异常报错 */
+  const run = useCallback(
+    async (action: () => Promise<void>): Promise<void> => {
+      try {
+        await action();
+      } catch (error) {
+        if (isRoleBlocked(error)) message.warning(error.message);
+        else message.error(error instanceof Error ? error.message : '操作失败');
+      }
+    },
+    [message],
+  );
 
   const bodyCode = (bodyId: string): string => bodies.find((body) => body.id === bodyId)?.code ?? bodyId;
 
@@ -87,8 +118,12 @@ export default function ExportView() {
     const total = inspectTable.rows.length;
     const pass = inspectTable.rows.filter((row) => row.verdict === 'pass').length;
     const rework = total - pass;
-    return { total, pass, rework, passPercent: total === 0 ? 0 : Math.round((pass / total) * 100) };
-  }, [inspectTable.rows]);
+    const unclaimed = inspectTable.rows.filter((row) => row.locateState === 'unclaimed').length;
+    const suspended =
+      inspectTable.rows.filter((row) => row.locateState === 'suspended').length +
+      coats.filter((coat) => coat.syncHold).length;
+    return { total, pass, rework, unclaimed, suspended, passPercent: total === 0 ? 0 : Math.round((pass / total) * 100) };
+  }, [inspectTable.rows, coats]);
 
   const draftBodyId = watchedBodyId ?? bodies[0]?.id ?? '';
   const draftCoats = coats.filter((coat) => coat.bodyId === draftBodyId).sort((a, b) => a.seq - b.seq);
@@ -100,6 +135,10 @@ export default function ExportView() {
   );
 
   const openCreate = (): void => {
+    if (!canQc) {
+      message.warning('越权操作已被挡下：质检结论与返工定位归成品质检室管理，请切换工位后再操作');
+      return;
+    }
     const bodyId = bodies[0]?.id ?? '';
     if (!bodyId) {
       message.warning('请先在胎体台账中登记胎体');
@@ -118,7 +157,8 @@ export default function ExportView() {
       defectNote: row.defectNote,
       inspector: row.inspector,
       date: row.date,
-      defectCoatSeq: row.defectCoatSeq,
+      // 待认领的旧定位不再信任原道次序号，需质检室按现行道次重新认领
+      defectCoatSeq: row.locateState === 'unclaimed' ? null : row.defectCoatSeq,
       defectRoomId: row.defectRoomId,
     });
     setOpen(true);
@@ -126,21 +166,70 @@ export default function ExportView() {
 
   const submit = async (): Promise<void> => {
     const values = await form.validateFields();
+    const bodyId = values.bodyId;
+    // 没确认完前这件胎体不再判合格
+    if (values.verdict === 'pass') {
+      const reason = passBlockReason(coats, inspectTable.rows, bodyId);
+      if (reason) {
+        message.error(`不能判合格：${reason}`);
+        return;
+      }
+    }
+    const body = bodies.find((item) => item.id === bodyId);
+    const locatedSeq = values.verdict === 'rework' && typeof values.defectCoatSeq === 'number' ? values.defectCoatSeq : null;
     const payload: InspectDraft = {
       ...values,
-      defectCoatSeq: values.verdict === 'rework' ? (values.defectCoatSeq ?? null) : null,
+      defectCoatSeq: values.verdict === 'rework' ? locatedSeq : null,
       defectRoomId: values.verdict === 'rework' ? (values.defectRoomId ?? null) : null,
+      // 定位生效即生成固定标识（胎体编号#道次序号），两侧按此对账
+      reworkKey: locatedSeq !== null && body ? buildReworkKey(body.code, locatedSeq) : null,
+      locateState: locatedSeq !== null ? 'located' : null,
     };
-    if (editing) {
-      await inspectTable.update(editing.id, payload);
-      message.success('已更新质检记录');
-    } else {
-      await inspectTable.create(payload, 'inspect');
-      message.success(
-        payload.verdict === 'rework' ? '已登记返工，可在下方返工清单中查看定位结果' : '已登记质检合格',
-      );
+    await run(async () => {
+      if (editing) {
+        await inspectTable.update(editing.id, payload);
+        message.success('已更新质检记录');
+      } else {
+        await inspectTable.create(payload, 'inspect');
+        message.success(
+          payload.verdict === 'rework' ? '已登记返工，定位道次及其后道次已转为待重确认' : '已登记质检合格',
+        );
+      }
+      // 系统通道联动：按现行生效定位重算该胎体道次失效范围
+      const affected = new Set<string>([bodyId]);
+      if (editing && editing.bodyId !== bodyId) affected.add(editing.bodyId);
+      for (const id of affected) {
+        await recomputeReworkInvalidation(id);
+      }
+      await loadCoats();
+      setOpen(false);
+    });
+  };
+
+  const handleRemove = async (row: Inspect): Promise<void> => {
+    await run(async () => {
+      await inspectTable.remove(row.id);
+      if (row.verdict === 'rework') {
+        await recomputeReworkInvalidation(row.bodyId);
+        await loadCoats();
+      }
+      message.success('已删除');
+    });
+  };
+
+  /** 两侧对账：按 胎体编号#道次序号 核对，哪侧失败只退哪侧 */
+  const handleReconcile = async (): Promise<void> => {
+    setReconciling(true);
+    try {
+      const result = await reconcileBothSides();
+      setReport(result);
+      await loadCoats();
+      if (result.qcError) message.error(`质检侧对账失败，已只退质检侧：${result.qcError}`);
+      if (result.benchError) message.error(`工序侧对账失败，已只退工序侧：${result.benchError}`);
+      if (!result.qcError && !result.benchError) message.success('两侧对账完成');
+    } finally {
+      setReconciling(false);
     }
-    setOpen(false);
   };
 
   const handleExport = async (): Promise<void> => {
@@ -177,6 +266,7 @@ export default function ExportView() {
       onOk: async () => {
         await importSnapshot(parsed as LacquerSnapshot);
         await Promise.all([loadBodies(), loadCoats(), loadRooms()]);
+        setMigration(readLastMigration());
         message.success('导入完成，数据已覆盖');
       },
     });
@@ -209,9 +299,20 @@ export default function ExportView() {
       dataIndex: 'defectNote',
       render: (value: string, record) =>
         record.verdict === 'rework' ? (
-          <Space direction="vertical" size={0}>
-            <Typography.Text>{value || '未填写'}</Typography.Text>
+          <Space direction="vertical" size={2}>
+            <Space size={4} wrap>
+              <Typography.Text>{value || '未填写'}</Typography.Text>
+              {record.locateState ? (
+                <Tag color={LOCATE_STATE_COLOR[record.locateState]}>{LOCATE_STATE_LABEL[record.locateState]}</Tag>
+              ) : null}
+              {record.reworkKey ? <Typography.Text code>{record.reworkKey}</Typography.Text> : null}
+            </Space>
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {record.locateState === 'unclaimed'
+                ? `旧定位 ${record.reworkKey ?? '未生成标识'} 已退回待认领：工序台调序或撤道后，需重新定位；`
+                : record.locateState === 'suspended'
+                  ? '对账不符已挂起，等工序台补齐道次；'
+                  : ''}
               定位道次：
               {record.defectCoatSeq === null
                 ? '未指定'
@@ -221,7 +322,7 @@ export default function ExportView() {
                     );
                     return coat
                       ? `第 ${coat.seq} 道 · ${PAINT_TYPE_LABEL[coat.paintType]} · ${coat.colorName}（${COAT_STATE_LABEL[coat.state]}）`
-                      : `第 ${record.defectCoatSeq} 道`;
+                      : `第 ${record.defectCoatSeq} 道（工序侧暂无此道）`;
                   })()}
               ；荫房：
               {record.defectRoomId === null
@@ -245,16 +346,22 @@ export default function ExportView() {
       width: 170,
       render: (_value, record) => (
         <Space size={4}>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
-            编辑
+          <Button
+            size="small"
+            type="link"
+            icon={<EditOutlined />}
+            disabled={!canQc}
+            onClick={() => openEdit(record)}
+          >
+            {record.locateState === 'unclaimed' ? '重新认领' : '编辑'}
           </Button>
           <Popconfirm
             title="删除该质检记录"
             okText="确认"
             cancelText="取消"
-            onConfirm={() => void inspectTable.remove(record.id).then(() => message.success('已删除'))}
+            onConfirm={() => void handleRemove(record)}
           >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+            <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={!canQc}>
               删除
             </Button>
           </Popconfirm>
@@ -306,8 +413,18 @@ export default function ExportView() {
         <StatBadge label="合格率" value={`${stat.passPercent}%`} percent={stat.passPercent} tone="success" />
         <StatBadge label="合格" value={stat.pass} suffix="条" tone="info" />
         <StatBadge label="返工" value={stat.rework} suffix="条" tone="danger" />
-        <StatBadge label="荫房记录" value={rooms.length} suffix="条" tone="warning" />
+        <StatBadge label="定位待认领" value={stat.unclaimed} suffix="条" tone="warning" />
+        <StatBadge label="对账挂起" value={stat.suspended} suffix="项" tone="danger" />
       </div>
+
+      {!canQc ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message="当前工位：髹涂工序台。质检结论与返工定位归成品质检室管理，登记与编辑只读；两侧对账与数据导出不受工位限制。"
+        />
+      ) : null}
 
       <Row gutter={16}>
         <Col xs={24} xl={15}>
@@ -315,7 +432,7 @@ export default function ExportView() {
             className="gb-table-card"
             title="质检登记"
             extra={
-              <Button type="primary" size="small" icon={<PlusOutlined />} onClick={openCreate}>
+              <Button type="primary" size="small" icon={<PlusOutlined />} disabled={!canQc} onClick={openCreate}>
                 新增质检
               </Button>
             }
@@ -369,6 +486,52 @@ export default function ExportView() {
             </pre>
           </Card>
 
+          <Card
+            title="两侧对账"
+            style={{ marginTop: 16 }}
+            extra={
+              <Button size="small" icon={<SwapOutlined />} loading={reconciling} onClick={() => void handleReconcile()}>
+                开始对账
+              </Button>
+            }
+          >
+            <Space direction="vertical" size={8} style={{ width: '100%' }}>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                按 胎体编号#道次序号 核对质检定位与工序道次：对不上的先挂起等对方补，哪侧失败只退哪侧。
+              </Typography.Text>
+              {report ? (
+                <Alert
+                  type={report.qcError || report.benchError ? 'error' : 'success'}
+                  showIcon
+                  message={
+                    report.qcError || report.benchError
+                      ? `${report.qcError ? `质检侧失败（只退质检侧）：${report.qcError}` : ''}${
+                          report.qcError && report.benchError ? '；' : ''
+                        }${report.benchError ? `工序侧失败（只退工序侧）：${report.benchError}` : ''}`
+                      : `质检侧挂起 ${report.qcSuspended.length} 条 / 恢复 ${report.qcRestored.length} 条；工序侧挂起 ${report.benchSuspended.length} 道 / 恢复 ${report.benchRestored.length} 道`
+                  }
+                  description={
+                    [
+                      ...report.qcSuspended.map((item) => `质检挂起：${item.reworkKey}`),
+                      ...report.qcRestored.map((item) => `质检恢复：${item.reworkKey}`),
+                      ...report.benchSuspended.map((item) => `工序挂起：${item.key}`),
+                      ...report.benchRestored.map((item) => `工序恢复：${item.key}`),
+                    ].join('；') || undefined
+                  }
+                />
+              ) : null}
+              {stat.unclaimed > 0 || stat.suspended > 0 ? (
+                <Typography.Text type="warning" style={{ fontSize: 12 }}>
+                  当前未了结：待认领 {stat.unclaimed} 条（需质检室重新定位）· 对账挂起 {stat.suspended} 项（等对方补）
+                </Typography.Text>
+              ) : (
+                <Typography.Text type="success" style={{ fontSize: 12 }}>
+                  两侧账目当前全部对上，无待认领或挂起项。
+                </Typography.Text>
+              )}
+            </Space>
+          </Card>
+
           <Card title="整库导出" style={{ marginTop: 16 }}>
             <Space direction="vertical" size={10} style={{ width: '100%' }}>
               <Typography.Text type="secondary">
@@ -395,6 +558,46 @@ export default function ExportView() {
               />
             </Space>
           </Card>
+
+          {migration ? (
+            <Card title="结构升级报告" style={{ marginTop: 16 }}>
+              <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  v{migration.from} → v{migration.to} · {migration.source === 'upgrade' ? '本地库升级' : '旧备份导入'} ·{' '}
+                  {new Date(migration.at).toLocaleString('zh-CN')}；已按当时的道次顺序为返工定位补固定标识{' '}
+                  {migration.backfilled} 条。
+                </Typography.Text>
+                {migration.failed.length === 0 ? (
+                  <Typography.Text type="success" style={{ fontSize: 12 }}>
+                    全部返工定位均已补上固定标识。
+                  </Typography.Text>
+                ) : (
+                  <>
+                    <Typography.Text type="danger" style={{ fontSize: 12 }}>
+                      以下 {migration.failed.length} 条补不出固定标识，已退回待认领，请质检室重新定位：
+                    </Typography.Text>
+                    <Table
+                      rowKey="inspectId"
+                      size="small"
+                      pagination={false}
+                      columns={[
+                        { title: '质检记录', dataIndex: 'inspectId', width: 150 },
+                        { title: '胎体', dataIndex: 'bodyCode', width: 100 },
+                        {
+                          title: '定位道次',
+                          dataIndex: 'defectCoatSeq',
+                          width: 90,
+                          render: (value: number | null) => (value === null ? '—' : `第 ${value} 道`),
+                        },
+                        { title: '补不出原因', dataIndex: 'reason' },
+                      ]}
+                      dataSource={migration.failed}
+                    />
+                  </>
+                )}
+              </Space>
+            </Card>
+          ) : null}
         </Col>
       </Row>
 

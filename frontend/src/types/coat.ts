@@ -27,6 +27,10 @@ export interface Coat {
   state: CoatState;
   /** 荫房判定异常时回写的「待复检」标记 */
   needRecheck: boolean;
+  /** 返工失效：质检定位到本道或之前某道后，本道不再算完成，待工序台按现在的顺序重新确认 */
+  pendingReconfirm: boolean;
+  /** 对账挂起：两侧按 胎体编号#道次序号 对不上，等质检室补齐返工定位 */
+  syncHold: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -91,5 +95,7 @@ export function createEmptyCoatDraft(bodyId: string, seq: number): CoatDraft {
     thicknessUm: 40,
     state: 'todo',
     needRecheck: false,
+    pendingReconfirm: false,
+    syncHold: false,
   };
 }

@@ -45,7 +45,7 @@ function csvCell(value: string | number | null): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
-/** 返工清单：定位到具体道次与荫房记录 */
+/** 返工清单：定位到具体道次与荫房记录，并带返工定位固定标识与状态 */
 export function buildReworkList(
   bodies: Body[],
   coats: Coat[],
@@ -62,9 +62,19 @@ export function buildReworkList(
     const body = bodies.find((item) => item.id === inspect.bodyId);
     const coat = coats.find((item) => item.bodyId === inspect.bodyId && item.seq === inspect.defectCoatSeq);
     const room = rooms.find((item) => item.id === inspect.defectRoomId);
+    const pendingCount = coats.filter((item) => item.bodyId === inspect.bodyId && item.pendingReconfirm).length;
+    const locateText =
+      inspect.locateState === 'located'
+        ? `${inspect.reworkKey ?? '未生成'}（已定位）`
+        : inspect.locateState === 'unclaimed'
+          ? `${inspect.reworkKey ?? '未生成'}（待认领：工序台已调序或撤道，需质检室重新定位）`
+          : inspect.locateState === 'suspended'
+            ? `${inspect.reworkKey ?? '未生成'}（已挂起：对账不符，等工序台补道次）`
+            : '未定位';
     lines.push(`${index + 1}. ${body ? `${body.code}（${BODY_MATERIAL_LABEL[body.material]}·${BODY_SHAPE_LABEL[body.shape]}）` : inspect.bodyId}`);
     lines.push(`   质检日期：${inspect.date}　质检人：${inspect.inspector || '未填写'}　结论：${INSPECT_VERDICT_LABEL[inspect.verdict]}`);
     lines.push(`   缺陷：${inspect.defectNote || '未填写'}`);
+    lines.push(`   定位标识：${locateText}`);
     lines.push(
       `   定位道次：${
         coat
@@ -79,6 +89,7 @@ export function buildReworkList(
           : '未指定'
       }`,
     );
+    lines.push(`   待重确认：${pendingCount} 道（确认完前该胎体不能再判合格）`);
     lines.push('');
   });
   return lines.join('\n');

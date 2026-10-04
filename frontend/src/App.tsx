@@ -4,7 +4,7 @@
  */
 import { useEffect } from 'react';
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { App as AntdApp, Badge, Button, Layout, Menu, Space, Tag, Typography } from 'antd';
+import { App as AntdApp, Badge, Button, Layout, Menu, Segmented, Space, Tag, Tooltip, Typography } from 'antd';
 import {
   AppstoreOutlined,
   BgColorsOutlined,
@@ -17,8 +17,10 @@ import {
 import { ROUTES } from './router';
 import { useBodyStore } from './stores/bodyStore';
 import { useCoatStore } from './stores/coatStore';
+import { useRoleStore } from './stores/roleStore';
 import { useRoomStore } from './stores/roomStore';
 import { initDatabase } from './utils/db';
+import { WORK_ROLE_LABEL, type WorkRole } from './utils/roleGuard';
 import { BODY_MATERIAL_LABEL, BODY_SHAPE_LABEL, BODY_STATE_LABEL } from './types/body';
 
 const { Header, Sider, Content, Footer } = Layout;
@@ -35,6 +37,8 @@ export default function App() {
   const loadCoats = useCoatStore((state) => state.loadCoats);
   const rooms = useRoomStore((state) => state.rooms);
   const loadRooms = useRoomStore((state) => state.loadRooms);
+  const role = useRoleStore((state) => state.role);
+  const setRole = useRoleStore((state) => state.setRole);
 
   useEffect(() => {
     let cancelled = false;
@@ -128,6 +132,22 @@ export default function App() {
             )}
           </Space>
           <Space>
+            <Tooltip title="两摊分记：工序台管髹涂道次与漆种，质检室管质检结论与返工定位；越权改对方那份会被挡下">
+              <Space size={6}>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  当前工位
+                </Typography.Text>
+                <Segmented
+                  size="small"
+                  value={role}
+                  onChange={(value) => setRole(value as WorkRole)}
+                  options={[
+                    { value: 'bench', label: WORK_ROLE_LABEL.bench },
+                    { value: 'qc', label: WORK_ROLE_LABEL.qc },
+                  ]}
+                />
+              </Space>
+            </Tooltip>
             <Button size="small" onClick={() => navigate(ROUTES.coats)}>
               进入道次编排
             </Button>

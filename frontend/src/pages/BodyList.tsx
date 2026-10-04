@@ -218,6 +218,11 @@ export default function BodyList() {
                         道次完成 <strong>{stat.coatDone}</strong> / {stat.coatTotal}（{stat.coatPercent}%）
                         {stat.currentSeq > 0 ? ` · 当前第 ${stat.currentSeq} 道` : ' · 全部完成'}
                       </Typography.Text>
+                      {stat.reworkPending > 0 ? (
+                        <Typography.Text type="danger">
+                          返工待重确认 {stat.reworkPending} 道，确认完前不能再判合格
+                        </Typography.Text>
+                      ) : null}
                       <Typography.Text type="secondary">当前工序：{currentCoatText(body.id)}</Typography.Text>
                       <Typography.Text type="secondary">最近荫房：{stat.lastRoomVerdict}</Typography.Text>
                       <Typography.Text type="secondary">

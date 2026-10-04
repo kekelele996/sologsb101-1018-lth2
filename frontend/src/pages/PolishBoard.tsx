@@ -30,6 +30,7 @@ import { useCoatProgress } from '@/hooks/useCoatProgress';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
+import { isRoleBlocked } from '@/utils/roleGuard';
 import {
   GRIT_SEQUENCE,
   POLISH_METHOD_COLOR,
@@ -146,15 +147,20 @@ export default function PolishBoard() {
     message.success(`已按 ${targets.length} 个道次生成目数序列（${GRIT_SEQUENCE.slice(0, targets.length).join(' / ')}）`);
   };
 
-  /** 打磨完成后把道次推进到已完成 */
+  /** 打磨完成后把道次推进到已完成（道次归工序台管理，越权会被挡下） */
   const finishPolish = async (row: Polish): Promise<void> => {
     const coat = bodyCoats.find((item) => item.seq === row.seq);
     if (!coat) {
       message.warning('未找到对应道次');
       return;
     }
-    await updateCoat(coat.id, { state: 'done', needRecheck: false });
-    message.success(`第 ${row.seq} 道打磨完成，道次已置为已完成`);
+    try {
+      await updateCoat(coat.id, { state: 'done', needRecheck: false });
+      message.success(`第 ${row.seq} 道打磨完成，道次已置为已完成`);
+    } catch (error) {
+      if (isRoleBlocked(error)) message.warning(error.message);
+      else message.error(error instanceof Error ? error.message : '操作失败');
+    }
   };
 
   const columns: ColumnsType<Polish> = [
@@ -164,7 +170,11 @@ export default function PolishBoard() {
       width: 120,
       render: (seq: number) => {
         const coat = bodyCoats.find((item) => item.seq === seq);
-        return coat ? <StageTag state={coat.state} seq={seq} needRecheck={coat.needRecheck} /> : `第 ${seq} 道`;
+        return coat ? (
+          <StageTag state={coat.state} seq={seq} needRecheck={coat.needRecheck} pendingReconfirm={coat.pendingReconfirm} />
+        ) : (
+          `第 ${seq} 道`
+        );
       },
     },
     { title: '磨料目数', dataIndex: 'grit', width: 110, render: (value: number) => <Tag color="gold">{value} 目</Tag> },
